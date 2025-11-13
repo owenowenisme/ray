@@ -375,6 +375,3 @@ class StreamingRepartition(AbstractMap):
     @property
     def target_num_rows_per_block(self) -> int:
         return self._target_num_rows_per_block
-
-    def can_modify_num_rows(self) -> bool:
-        return False

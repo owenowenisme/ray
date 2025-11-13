@@ -1,5 +1,6 @@
 import itertools
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from ray.data._internal.compute import (
@@ -21,7 +22,11 @@ from ray.data._internal.execution.operators.actor_pool_map_operator import (
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
-from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_operator import (
+    BaseRefBundler,
+    BlockRefBundler,
+    MapOperator,
+)
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
@@ -35,6 +40,7 @@ from ray.data._internal.logical.operators.map_operator import (
     AbstractMap,
     AbstractUDFMap,
 )
+from ray.data._internal.streaming_repartition import StreamingRepartitionRefBundler
 from ray.util.annotations import DeveloperAPI
 
 # Scheduling strategy can be inherited from upstream operator if not specified.
@@ -42,6 +48,17 @@ INHERITABLE_REMOTE_ARGS = ["scheduling_strategy"]
 
 
 logger = logging.getLogger(__name__)
+
+
+def _lcm(a: int, b: int) -> int:
+    return abs(a * b) // math.gcd(a, b)
+
+
+def _min_multiple(a: int, b: int) -> int:
+    """
+    return the smallest multiple of a that is greater than or equal to b.
+    """
+    return math.ceil(b / a) * a
 
 
 class FuseOperators(Rule):
@@ -75,6 +92,51 @@ class FuseOperators(Rule):
         for input in op._input_dependencies:
             input._output_dependencies.append(op)
             self._update_output_deps(input)
+
+    def _get_fused_refbundler(
+        self, upstream_refbundler: BaseRefBundler, downstream_refbundler: BaseRefBundler
+    ) -> Optional[BaseRefBundler]:
+        """
+        Returns the compatible new refbundler for the fused map operator.
+        If not compatible, returns None.
+        """
+        if isinstance(
+            upstream_refbundler, StreamingRepartitionRefBundler
+        ) and isinstance(downstream_refbundler, StreamingRepartitionRefBundler):
+            return StreamingRepartitionRefBundler(
+                _lcm(
+                    upstream_refbundler._target_num_rows,
+                    downstream_refbundler._target_num_rows,
+                )
+            )
+        if isinstance(upstream_refbundler, BlockRefBundler) and isinstance(
+            downstream_refbundler, BlockRefBundler
+        ):
+            return BlockRefBundler(
+                min_rows_per_bundle=max(
+                    upstream_refbundler._min_rows_per_bundle,
+                    downstream_refbundler._min_rows_per_bundle,
+                )
+            )
+        if isinstance(
+            upstream_refbundler, StreamingRepartitionRefBundler
+        ) and isinstance(downstream_refbundler, BlockRefBundler):
+            return StreamingRepartitionRefBundler(
+                _min_multiple(
+                    upstream_refbundler._target_num_rows,
+                    downstream_refbundler._min_rows_per_bundle,
+                )
+            )
+        if isinstance(upstream_refbundler, BlockRefBundler) and isinstance(
+            downstream_refbundler, StreamingRepartitionRefBundler
+        ):
+            return BlockRefBundler(
+                min_rows_per_bundle=_min_multiple(
+                    downstream_refbundler._target_num_rows,
+                    upstream_refbundler._min_rows_per_bundle,
+                )
+            )
+        return None
 
     def _fuse_map_operators_in_dag(self, dag: PhysicalOperator) -> MapOperator:
         """Starting at the given operator, traverses up the DAG of operators
@@ -159,6 +221,16 @@ class FuseOperators(Rule):
                 isinstance(up_op, TaskPoolMapOperator)
                 and isinstance(down_op, AllToAllOperator)
             )
+        ):
+            return False
+
+        if (
+            isinstance(up_op, MapOperator)
+            and isinstance(down_op, MapOperator)
+            and self._get_fused_refbundler(
+                up_op._block_ref_bundler, down_op._block_ref_bundler
+            )
+            is None
         ):
             return False
 
@@ -287,10 +359,10 @@ class FuseOperators(Rule):
         assert isinstance(down_logical_op, AbstractMap)
         assert isinstance(up_logical_op, AbstractMap)
 
-        # Derive min num rows per input bundle
-        min_rows_per_bundled_input = self._derive_bundle_min_num_rows(
-            down_logical_op, up_logical_op
+        refbundler = self._get_fused_refbundler(
+            up_op._block_ref_bundler, down_op._block_ref_bundler
         )
+        assert refbundler is not None
 
         target_max_block_size = self._get_merged_target_max_block_size(
             up_op.target_max_block_size_override, down_op.target_max_block_size_override
@@ -322,7 +394,7 @@ class FuseOperators(Rule):
             target_max_block_size_override=target_max_block_size,
             name=name,
             compute_strategy=compute,
-            min_rows_per_bundle=min_rows_per_bundled_input,
+            ref_bundler=refbundler,
             map_task_kwargs=map_task_kwargs,
             ray_remote_args=ray_remote_args,
             ray_remote_args_fn=ray_remote_args_fn,
@@ -350,7 +422,6 @@ class FuseOperators(Rule):
                 fn_kwargs=down_logical_op._fn_kwargs,
                 fn_constructor_args=down_logical_op._fn_constructor_args,
                 fn_constructor_kwargs=down_logical_op._fn_constructor_kwargs,
-                min_rows_per_bundled_input=min_rows_per_bundled_input,
                 compute=compute,
                 ray_remote_args_fn=ray_remote_args_fn,
                 ray_remote_args=ray_remote_args,
@@ -360,7 +431,6 @@ class FuseOperators(Rule):
             logical_op = AbstractMap(
                 name,
                 input_op,
-                min_rows_per_bundled_input=min_rows_per_bundled_input,
                 ray_remote_args_fn=ray_remote_args_fn,
                 ray_remote_args=ray_remote_args,
             )
