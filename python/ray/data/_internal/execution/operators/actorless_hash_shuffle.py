@@ -53,7 +53,6 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
-from ray.data._internal.execution.util import get_rss_mb, init_worker_memory, release_memory
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -76,7 +75,7 @@ logger = logging.getLogger(__name__)
 BlockTransformer = Callable[[Block], Block]
 
 
-@ray.remote(max_calls=5)
+@ray.remote(max_calls=1)
 def _shuffle_map(
     *blocks: Block,
     key_columns: List[str],
@@ -97,6 +96,11 @@ def _shuffle_map(
     - Index 1..N: the partition shard (``pa.Table``) or ``None`` for empty
       partitions.
 
+    Uses ``max_calls=1`` to kill the worker after each task, guaranteeing
+    full RSS release. Allocator tuning (mallopt, system pool) was tested
+    and proven ineffective — Arrow's posix_memalign bypasses glibc's
+    M_MMAP_THRESHOLD, so freed buffers are never munmap'd.
+
     Args:
         *blocks: One or more input blocks to shuffle. Multiple blocks are
             concatenated before partitioning (pre-map merge).
@@ -108,75 +112,52 @@ def _shuffle_map(
         A tuple of ``(BlockMetadata, List[int], Dict)`` and the partition
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
-    init_worker_memory()
-    rss_start = get_rss_mb()
+    stats = BlockExecStats.builder()
 
-    try:
-        stats = BlockExecStats.builder()
+    # Concatenate multiple blocks when pre-map merge is active.
+    # Use pa.concat_tables for zero-copy: the result references the input
+    # blocks' buffers in shared memory instead of copying ~1 GB to heap.
+    if len(blocks) == 1:
+        block = blocks[0]
+    else:
+        block = pa.concat_tables(blocks)
 
-        # Concatenate multiple blocks when pre-map merge is active.
-        # Use pa.concat_tables for zero-copy: the result references the input
-        # blocks' buffers in shared memory instead of copying ~1 GB to heap.
-        if len(blocks) == 1:
-            block = blocks[0]
-        else:
-            block = pa.concat_tables(blocks)
+    if block_transformer is not None:
+        block = block_transformer(block)
 
-        if block_transformer is not None:
-            block = block_transformer(block)
+    block = TableBlockAccessor.try_convert_block_type(block, block_type=BlockType.ARROW)
 
-        block = TableBlockAccessor.try_convert_block_type(block, block_type=BlockType.ARROW)
+    input_block_metadata = BlockAccessor.for_block(block).get_metadata(
+        block_exec_stats=stats.build(block_ser_time_s=0),
+    )
 
-        input_block_metadata = BlockAccessor.for_block(block).get_metadata(
-            block_exec_stats=stats.build(block_ser_time_s=0),
-        )
+    if block.num_rows == 0:
+        return (input_block_metadata, [], {}), *([None] * num_partitions)  # noqa: E501
 
-        if block.num_rows == 0:
-            return (input_block_metadata, [], {}), *([None] * num_partitions)  # noqa: E501
+    assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
 
-        assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
+    # Defragment chunked tables before hash-partitioning. Blocks from
+    # parquet reads or pre-map merge concatenation can have multiple chunks
+    # per column (e.g., 8 chunks from parquet row groups). The downstream
+    # table.take() calls (one per partition) are ~8x slower on chunked
+    # mmap'd data due to page faults.
+    if any(col.num_chunks > 1 for col in block.columns):
+        block = block.combine_chunks()
 
-        # Defragment chunked tables before hash-partitioning. Blocks from
-        # parquet reads or pre-map merge concatenation can have multiple chunks
-        # per column (e.g., 8 chunks from parquet row groups). The downstream
-        # table.take() calls (one per partition) are ~8x slower on chunked
-        # mmap'd data due to page faults.
-        if any(col.num_chunks > 1 for col in block.columns):
-            block = block.combine_chunks()
+    block_partitions = hash_partition(
+        block, hash_cols=key_columns, num_partitions=num_partitions
+    )
 
-        block_partitions = hash_partition(
-            block, hash_cols=key_columns, num_partitions=num_partitions
-        )
+    shards = [None] * num_partitions
+    non_empty_pids = []
+    shard_sizes = {}
+    for pid_key, shard in block_partitions.items():
+        if shard.num_rows > 0:
+            shards[pid_key] = shard
+            non_empty_pids.append(pid_key)
+            shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
 
-        # Drop input block reference before building return value so it can
-        # be freed during serialization, reducing peak RSS.
-        del block
-
-        shards = [None] * num_partitions
-        non_empty_pids = []
-        shard_sizes = {}
-        for pid_key, shard in block_partitions.items():
-            if shard.num_rows > 0:
-                shards[pid_key] = shard
-                non_empty_pids.append(pid_key)
-                shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
-        del block_partitions
-
-        rss_before_trim = get_rss_mb()
-        release_memory()
-        rss_end = get_rss_mb()
-
-        logger.info(
-            f"Shuffle map memory: "
-            f"rss={rss_start:.0f}->{rss_before_trim:.0f}->{rss_end:.0f}MB "
-            f"(trimmed={rss_before_trim - rss_end:.0f}MB), "
-            f"input={input_block_metadata.size_bytes / 1e6:.0f}MB, "
-            f"blocks={len(blocks)}, partitions={num_partitions}"
-        )
-
-        return (input_block_metadata, non_empty_pids, shard_sizes), *shards
-    finally:
-        release_memory()
+    return (input_block_metadata, non_empty_pids, shard_sizes), *shards
 
 
 @ray.remote

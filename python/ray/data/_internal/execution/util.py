@@ -14,42 +14,11 @@ _worker_memory_initialized = False
 
 
 def init_worker_memory():
-    """One-time worker init: switch Arrow to system allocator and tune glibc
-    malloc to return freed pages to the OS more aggressively.
+    """No-op placeholder. Allocator tuning (mallopt, system pool switch) was
+    tested and proven ineffective — Arrow's posix_memalign bypasses glibc's
+    M_MMAP_THRESHOLD. Worker memory is bounded via max_calls instead.
     """
-    global _worker_memory_initialized
-    if _worker_memory_initialized:
-        return
-    _worker_memory_initialized = True
-
-    import pyarrow as pa
-
-    old_pool = pa.default_memory_pool().backend_name
-    if old_pool != "system":
-        pa.set_memory_pool(pa.system_memory_pool())
-
-    mallopt_results = {}
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL("libc.so.6")
-        libc.mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
-        libc.mallopt.restype = ctypes.c_int
-
-        M_MMAP_THRESHOLD = -3
-        M_TRIM_THRESHOLD = -1
-        M_ARENA_MAX = -8
-
-        mallopt_results["mmap_thresh"] = libc.mallopt(M_MMAP_THRESHOLD, 128 * 1024)
-        mallopt_results["trim_thresh"] = libc.mallopt(M_TRIM_THRESHOLD, 128 * 1024)
-        mallopt_results["arena_max"] = libc.mallopt(M_ARENA_MAX, 2)
-    except (OSError, AttributeError) as e:
-        mallopt_results["error"] = str(e)
-
-    _logger.info(
-        f"Worker memory init: Arrow pool {old_pool}->system, "
-        f"mallopt={mallopt_results}"
-    )
+    pass
 
 
 def get_rss_mb():
