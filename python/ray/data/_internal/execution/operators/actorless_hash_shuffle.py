@@ -53,7 +53,12 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
-from ray.data._internal.execution.util import get_rss_mb, init_worker_memory, release_memory
+from ray.data._internal.execution.util import (
+    get_memory_breakdown_mb,
+    get_rss_mb,
+    init_worker_memory,
+    release_memory,
+)
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -122,31 +127,12 @@ def _shuffle_map(
         A tuple of ``(BlockMetadata, List[int], Dict)`` and the partition
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
-    import gc
-    import os
-
     init_worker_memory()
 
-    # Force jemalloc to process pending frees from background threads
-    # (Ray's serialization may free shards on a different thread, leaving
-    # them in that thread's tcache). A small alloc+free on the main thread
-    # triggers jemalloc's cross-thread cache drain, then release_unused()
-    # purges the resulting dirty pages.
-    gc.collect()
-    buf = pa.allocate_buffer(1, memory_pool=pa.default_memory_pool())
-    del buf
-    pa.default_memory_pool().release_unused()
-
-    rss_start = get_rss_mb()
-    arrow_start = pa.total_allocated_bytes() / (1024 * 1024)
-    pool_name = pa.default_memory_pool().backend_name
-    purge_delay = os.environ.get("MIMALLOC_PURGE_DELAY", "NOT SET")
+    rss_s, priv_s, shared_s = get_memory_breakdown_mb()
 
     stats = BlockExecStats.builder()
 
-    # Concatenate multiple blocks when pre-map merge is active.
-    # Use pa.concat_tables for zero-copy: the result references the input
-    # blocks' buffers in shared memory instead of copying ~1 GB to heap.
     if len(blocks) == 1:
         block = blocks[0]
     else:
@@ -166,34 +152,14 @@ def _shuffle_map(
 
     assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
 
-    # Defragment chunked tables before hash-partitioning. Blocks from
-    # parquet reads or pre-map merge concatenation can have multiple chunks
-    # per column (e.g., 8 chunks from parquet row groups). The downstream
-    # table.take() calls (one per partition) are ~8x slower on chunked
-    # mmap'd data due to page faults.
     if any(col.num_chunks > 1 for col in block.columns):
         block = block.combine_chunks()
-
-    import sys
-
-    arrow_after_combine = pa.total_allocated_bytes() / (1024 * 1024)
-    block_nbytes = block.nbytes
-    block_bufsize = block.get_total_buffer_size()
-    block_refcount = sys.getrefcount(block)
 
     block_partitions = hash_partition(
         block, hash_cols=key_columns, num_partitions=num_partitions
     )
 
-    arrow_after_partition = pa.total_allocated_bytes() / (1024 * 1024)
-    block_refcount_after = sys.getrefcount(block)
-
-    rss_before_del = get_rss_mb()
     del block
-    gc.collect()
-    pa.default_memory_pool().release_unused()
-    rss_after_del = get_rss_mb()
-    arrow_after_del_block = pa.total_allocated_bytes() / (1024 * 1024)
 
     shards = [None] * num_partitions
     non_empty_pids = []
@@ -204,34 +170,18 @@ def _shuffle_map(
             non_empty_pids.append(pid_key)
             shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
     del block_partitions
-    gc.collect()
-
-    arrow_after_del_parts = pa.total_allocated_bytes() / (1024 * 1024)
-    rss_before_trim = get_rss_mb()
 
     release_memory()
-    pa.default_memory_pool().release_unused()
 
-    arrow_final = pa.total_allocated_bytes() / (1024 * 1024)
-    rss_end = get_rss_mb()
+    rss_e, priv_e, shared_e = get_memory_breakdown_mb()
 
     logger.info(
         f"Shuffle map memory: "
-        f"pool={pool_name}, "
-        f"block_refcount={block_refcount}->{block_refcount_after}, "
-        f"block_nbytes={block_nbytes / 1e6:.0f}MB, "
-        f"block_bufsize={block_bufsize / 1e6:.0f}MB, "
-        f"rss={rss_start:.0f}->peak{rss_before_del:.0f}"
-        f"->del{rss_after_del:.0f}->{rss_end:.0f}MB "
-        f"(del_freed={rss_before_del - rss_after_del:.0f}MB, "
-        f"trimmed={rss_before_trim - rss_end:.0f}MB), "
-        f"arrow={arrow_start:.0f}->{arrow_after_combine:.0f}"
-        f"->{arrow_after_partition:.0f}"
-        f"->{arrow_after_del_block:.0f}"
-        f"->{arrow_after_del_parts:.0f}"
-        f"->{arrow_final:.0f}MB, "
-        f"input={input_block_metadata.size_bytes / 1e6:.0f}MB, "
-        f"blocks={len(blocks)}, partitions={num_partitions}"
+        f"rss={rss_s:.0f}->{rss_e:.0f}MB, "
+        f"private={priv_s:.0f}->{priv_e:.0f}MB, "
+        f"shared={shared_s:.0f}->{shared_e:.0f}MB, "
+        f"arrow={pa.total_allocated_bytes() / 1e6:.0f}MB, "
+        f"input={input_block_metadata.size_bytes / 1e6:.0f}MB"
     )
 
     return (input_block_metadata, non_empty_pids, shard_sizes), *shards

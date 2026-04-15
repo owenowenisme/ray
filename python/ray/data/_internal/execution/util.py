@@ -60,6 +60,24 @@ def get_rss_mb():
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
+def get_memory_breakdown_mb():
+    """Return (rss, private, shared) from /proc/self/smaps_rollup."""
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            data = f.read()
+        vals = {}
+        for line in data.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                vals[parts[0].rstrip(":")] = int(parts[1])
+        rss = vals.get("Rss", 0) / 1024
+        shared = (vals.get("Shared_Clean", 0) + vals.get("Shared_Dirty", 0)) / 1024
+        private = (vals.get("Private_Clean", 0) + vals.get("Private_Dirty", 0)) / 1024
+        return rss, private, shared
+    except (FileNotFoundError, OSError):
+        return get_rss_mb(), 0, 0
+
+
 def release_memory():
     """Force GC + return freed pages to OS via Arrow pool purge and malloc trim."""
     import ctypes
