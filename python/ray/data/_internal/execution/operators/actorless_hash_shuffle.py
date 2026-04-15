@@ -53,6 +53,7 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
+from ray.data._internal.execution.util import get_rss_mb, release_memory
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -75,7 +76,22 @@ logger = logging.getLogger(__name__)
 BlockTransformer = Callable[[Block], Block]
 
 
-@ray.remote(max_calls=1)
+# runtime_env isolates shuffle map workers into a dedicated pool with
+# MALLOC_MMAP_THRESHOLD_ set at process startup.  This ensures:
+# 1. glibc uses mmap (not sbrk) for all allocations >128 KB, so free()
+#    calls munmap and returns pages to the OS immediately.
+# 2. ReadParquet / Project tasks never run on these workers (and vice
+#    versa), preventing cross-task RSS accumulation.
+_SHUFFLE_MAP_RUNTIME_ENV = {
+    "env_vars": {
+        "MALLOC_MMAP_THRESHOLD_": "131072",
+        "MALLOC_TRIM_THRESHOLD_": "131072",
+        "MALLOC_MMAP_MAX_": "-1",
+    },
+}
+
+
+@ray.remote
 def _shuffle_map(
     *blocks: Block,
     key_columns: List[str],
@@ -96,11 +112,6 @@ def _shuffle_map(
     - Index 1..N: the partition shard (``pa.Table``) or ``None`` for empty
       partitions.
 
-    Uses ``max_calls=1`` to kill the worker after each task, guaranteeing
-    full RSS release. Allocator tuning (mallopt, system pool) was tested
-    and proven ineffective — Arrow's posix_memalign bypasses glibc's
-    M_MMAP_THRESHOLD, so freed buffers are never munmap'd.
-
     Args:
         *blocks: One or more input blocks to shuffle. Multiple blocks are
             concatenated before partitioning (pre-map merge).
@@ -112,6 +123,8 @@ def _shuffle_map(
         A tuple of ``(BlockMetadata, List[int], Dict)`` and the partition
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
+    rss_start = get_rss_mb()
+
     stats = BlockExecStats.builder()
 
     # Concatenate multiple blocks when pre-map merge is active.
@@ -148,6 +161,8 @@ def _shuffle_map(
         block, hash_cols=key_columns, num_partitions=num_partitions
     )
 
+    del block
+
     shards = [None] * num_partitions
     non_empty_pids = []
     shard_sizes = {}
@@ -156,6 +171,19 @@ def _shuffle_map(
             shards[pid_key] = shard
             non_empty_pids.append(pid_key)
             shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
+    del block_partitions
+
+    rss_before_trim = get_rss_mb()
+    release_memory()
+    rss_end = get_rss_mb()
+
+    logger.info(
+        f"Shuffle map memory: "
+        f"rss={rss_start:.0f}->{rss_before_trim:.0f}->{rss_end:.0f}MB "
+        f"(trimmed={rss_before_trim - rss_end:.0f}MB), "
+        f"input={input_block_metadata.size_bytes / 1e6:.0f}MB, "
+        f"blocks={len(blocks)}, partitions={num_partitions}"
+    )
 
     return (input_block_metadata, non_empty_pids, shard_sizes), *shards
 
@@ -450,6 +478,7 @@ class ActorlessHashShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         map_refs = _shuffle_map.options(
             **shuffle_task_resources,
             num_returns=self._num_partitions + 1,
+            runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
         ).remote(
             *block_refs,
             key_columns=self._key_columns,
