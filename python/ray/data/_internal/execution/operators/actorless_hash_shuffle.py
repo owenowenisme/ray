@@ -84,6 +84,7 @@ BlockTransformer = Callable[[Block], Block]
 _SHUFFLE_MAP_RUNTIME_ENV = {
     "env_vars": {
         "MIMALLOC_PURGE_DELAY": "0",
+        "MIMALLOC_PURGE_DECOMMITS": "1",
         "MIMALLOC_ARENA_EAGER_COMMIT": "0",
     },
 }
