@@ -14,11 +14,45 @@ _worker_memory_initialized = False
 
 
 def init_worker_memory():
-    """No-op placeholder. Allocator tuning (mallopt, system pool switch) was
-    tested and proven ineffective — Arrow's posix_memalign bypasses glibc's
-    M_MMAP_THRESHOLD. Worker memory is bounded via max_calls instead.
+    """Configure mimalloc to decommit freed pages immediately.
+
+    Arrow uses bundled mimalloc which by default uses MADV_FREE (lazy
+    reclaim — RSS stays high) and delays purging. This calls
+    mi_option_set() at runtime to force MADV_DONTNEED (immediate RSS
+    drop). Environment variables don't work because mimalloc initializes
+    before Ray sets them (workers are forked from a parent that already
+    imported pyarrow).
     """
-    pass
+    global _worker_memory_initialized
+    if _worker_memory_initialized:
+        return
+    _worker_memory_initialized = True
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        # mimalloc symbols are linked into the process via pyarrow.
+        # ctypes.CDLL(None) exposes all symbols from the main executable
+        # and its loaded shared libraries.
+        proc = ctypes.CDLL(None)
+        mi_option_set = proc.mi_option_set
+        mi_option_set.argtypes = [ctypes.c_int, ctypes.c_long]
+        mi_option_set.restype = None
+
+        # Enum values from mimalloc.h (v2.1.x).
+        # These must match the mimalloc version bundled with pyarrow.
+        MI_OPTION_PURGE_DELAY = 5
+        MI_OPTION_PURGE_DECOMMITS = 13
+
+        mi_option_set(MI_OPTION_PURGE_DELAY, 0)
+        mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1)
+
+        _logger.info(
+            "Worker memory init: set mimalloc purge_delay=0, purge_decommits=1"
+        )
+    except Exception as e:
+        _logger.warning(f"Worker memory init: failed to configure mimalloc: {e}")
 
 
 def get_rss_mb():

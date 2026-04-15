@@ -53,7 +53,7 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
-from ray.data._internal.execution.util import get_rss_mb, release_memory
+from ray.data._internal.execution.util import get_rss_mb, init_worker_memory, release_memory
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -124,6 +124,8 @@ def _shuffle_map(
     """
     import gc
     import os
+
+    init_worker_memory()
 
     rss_start = get_rss_mb()
     arrow_start = pa.total_allocated_bytes() / (1024 * 1024)
