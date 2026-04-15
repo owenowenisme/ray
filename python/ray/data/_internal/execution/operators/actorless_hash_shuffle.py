@@ -53,6 +53,7 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
+from ray.data._internal.execution.util import init_worker_memory
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -75,7 +76,37 @@ logger = logging.getLogger(__name__)
 BlockTransformer = Callable[[Block], Block]
 
 
-@ray.remote
+def _get_rss_mb():
+    """Return current process RSS in MB."""
+    import os
+
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (FileNotFoundError, OSError):
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def _release_memory():
+    """Force GC + return freed pages to OS via Arrow pool purge and malloc trim."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+@ray.remote(max_calls=5)
 def _shuffle_map(
     *blocks: Block,
     key_columns: List[str],
@@ -107,52 +138,75 @@ def _shuffle_map(
         A tuple of ``(BlockMetadata, List[int], Dict)`` and the partition
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
-    stats = BlockExecStats.builder()
+    init_worker_memory()
+    rss_start = _get_rss_mb()
 
-    # Concatenate multiple blocks when pre-map merge is active.
-    # Use pa.concat_tables for zero-copy: the result references the input
-    # blocks' buffers in shared memory instead of copying ~1 GB to heap.
-    if len(blocks) == 1:
-        block = blocks[0]
-    else:
-        block = pa.concat_tables(blocks)
+    try:
+        stats = BlockExecStats.builder()
 
-    if block_transformer is not None:
-        block = block_transformer(block)
+        # Concatenate multiple blocks when pre-map merge is active.
+        # Use pa.concat_tables for zero-copy: the result references the input
+        # blocks' buffers in shared memory instead of copying ~1 GB to heap.
+        if len(blocks) == 1:
+            block = blocks[0]
+        else:
+            block = pa.concat_tables(blocks)
 
-    block = TableBlockAccessor.try_convert_block_type(block, block_type=BlockType.ARROW)
+        if block_transformer is not None:
+            block = block_transformer(block)
 
-    input_block_metadata = BlockAccessor.for_block(block).get_metadata(
-        block_exec_stats=stats.build(block_ser_time_s=0),
-    )
+        block = TableBlockAccessor.try_convert_block_type(block, block_type=BlockType.ARROW)
 
-    if block.num_rows == 0:
-        return (input_block_metadata, [], {}), *([None] * num_partitions)  # noqa: E501
+        input_block_metadata = BlockAccessor.for_block(block).get_metadata(
+            block_exec_stats=stats.build(block_ser_time_s=0),
+        )
 
-    assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
+        if block.num_rows == 0:
+            return (input_block_metadata, [], {}), *([None] * num_partitions)  # noqa: E501
 
-    # Defragment chunked tables before hash-partitioning. Blocks from
-    # parquet reads or pre-map merge concatenation can have multiple chunks
-    # per column (e.g., 8 chunks from parquet row groups). The downstream
-    # table.take() calls (one per partition) are ~8x slower on chunked
-    # mmap'd data due to page faults.
-    if any(col.num_chunks > 1 for col in block.columns):
-        block = block.combine_chunks()
+        assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
 
-    block_partitions = hash_partition(
-        block, hash_cols=key_columns, num_partitions=num_partitions
-    )
+        # Defragment chunked tables before hash-partitioning. Blocks from
+        # parquet reads or pre-map merge concatenation can have multiple chunks
+        # per column (e.g., 8 chunks from parquet row groups). The downstream
+        # table.take() calls (one per partition) are ~8x slower on chunked
+        # mmap'd data due to page faults.
+        if any(col.num_chunks > 1 for col in block.columns):
+            block = block.combine_chunks()
 
-    shards = [None] * num_partitions
-    non_empty_pids = []
-    shard_sizes = {}
-    for pid_key, shard in block_partitions.items():
-        if shard.num_rows > 0:
-            shards[pid_key] = shard
-            non_empty_pids.append(pid_key)
-            shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
+        block_partitions = hash_partition(
+            block, hash_cols=key_columns, num_partitions=num_partitions
+        )
 
-    return (input_block_metadata, non_empty_pids, shard_sizes), *shards
+        # Drop input block reference before building return value so it can
+        # be freed during serialization, reducing peak RSS.
+        del block
+
+        shards = [None] * num_partitions
+        non_empty_pids = []
+        shard_sizes = {}
+        for pid_key, shard in block_partitions.items():
+            if shard.num_rows > 0:
+                shards[pid_key] = shard
+                non_empty_pids.append(pid_key)
+                shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
+        del block_partitions
+
+        rss_before_trim = _get_rss_mb()
+        _release_memory()
+        rss_end = _get_rss_mb()
+
+        logger.info(
+            f"Shuffle map memory: "
+            f"rss={rss_start:.0f}->{rss_before_trim:.0f}->{rss_end:.0f}MB "
+            f"(trimmed={rss_before_trim - rss_end:.0f}MB), "
+            f"input={input_block_metadata.size_bytes / 1e6:.0f}MB, "
+            f"blocks={len(blocks)}, partitions={num_partitions}"
+        )
+
+        return (input_block_metadata, non_empty_pids, shard_sizes), *shards
+    finally:
+        _release_memory()
 
 
 @ray.remote

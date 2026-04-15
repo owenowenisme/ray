@@ -60,7 +60,7 @@ from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
     MapTransformer,
 )
-from ray.data._internal.execution.util import memory_string
+from ray.data._internal.execution.util import init_worker_memory, memory_string
 from ray.data._internal.stats import StatsDict
 from ray.data._internal.util import MemoryProfiler
 from ray.data.block import (
@@ -740,6 +740,8 @@ def _map_task(
         A generator of blocks, followed by the list of BlockMetadata for the blocks
         as the last generator return.
     """
+    init_worker_memory()
+
     task_start_s = time.perf_counter()
 
     blk_exec_stats_builder = BlockExecStats.builder()
