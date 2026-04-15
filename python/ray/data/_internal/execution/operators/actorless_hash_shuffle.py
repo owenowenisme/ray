@@ -55,9 +55,7 @@ from ray.data._internal.execution.operators.sub_progress import SubProgressBarMi
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
 from ray.data._internal.execution.util import (
     get_memory_breakdown_mb,
-    get_rss_mb,
     init_worker_memory,
-    release_memory,
 )
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
@@ -133,6 +131,9 @@ def _shuffle_map(
 
     stats = BlockExecStats.builder()
 
+    # Concatenate multiple blocks when pre-map merge is active.
+    # Use pa.concat_tables for zero-copy: the result references the input
+    # blocks' buffers in shared memory instead of copying ~1 GB to heap.
     if len(blocks) == 1:
         block = blocks[0]
     else:
@@ -152,14 +153,17 @@ def _shuffle_map(
 
     assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
 
+    # Defragment chunked tables before hash-partitioning. Blocks from
+    # parquet reads or pre-map merge concatenation can have multiple chunks
+    # per column (e.g., 8 chunks from parquet row groups). The downstream
+    # table.take() calls (one per partition) are ~8x slower on chunked
+    # mmap'd data due to page faults.
     if any(col.num_chunks > 1 for col in block.columns):
         block = block.combine_chunks()
 
     block_partitions = hash_partition(
         block, hash_cols=key_columns, num_partitions=num_partitions
     )
-
-    del block
 
     shards = [None] * num_partitions
     non_empty_pids = []
@@ -169,9 +173,6 @@ def _shuffle_map(
             shards[pid_key] = shard
             non_empty_pids.append(pid_key)
             shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
-    del block_partitions
-
-    release_memory()
 
     rss_e, priv_e, shared_e = get_memory_breakdown_mb()
 

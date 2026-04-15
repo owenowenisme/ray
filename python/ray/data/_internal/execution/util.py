@@ -46,20 +46,6 @@ def init_worker_memory():
         )
 
 
-def get_rss_mb():
-    """Return current process RSS in MB."""
-    import os
-
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (FileNotFoundError, OSError):
-        import resource
-
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-
-
 def get_memory_breakdown_mb():
     """Return (rss, private, shared) from /proc/self/smaps_rollup."""
     try:
@@ -78,25 +64,7 @@ def get_memory_breakdown_mb():
         private = (vals.get("Private_Clean", 0) + vals.get("Private_Dirty", 0)) / 1024
         return rss, private, shared
     except (FileNotFoundError, OSError):
-        return get_rss_mb(), 0, 0
-
-
-def release_memory():
-    """Force GC + return freed pages to OS via Arrow pool purge and malloc trim."""
-    import ctypes
-    import gc
-
-    import pyarrow as pa
-
-    gc.collect()
-    try:
-        pa.default_memory_pool().release_unused()
-    except Exception:
-        pass
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
+        return 0, 0, 0
 
 
 def make_ref_bundles(simple_data: List[List[Any]]) -> List["RefBundle"]:
