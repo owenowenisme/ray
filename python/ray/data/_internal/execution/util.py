@@ -14,45 +14,36 @@ _worker_memory_initialized = False
 
 
 def init_worker_memory():
-    """Configure mimalloc to decommit freed pages immediately.
+    """Configure Arrow's memory pool for aggressive page return.
 
-    Arrow uses bundled mimalloc which by default uses MADV_FREE (lazy
-    reclaim — RSS stays high) and delays purging. This calls
-    mi_option_set() at runtime to force MADV_DONTNEED (immediate RSS
-    drop). Environment variables don't work because mimalloc initializes
-    before Ray sets them (workers are forked from a parent that already
-    imported pyarrow).
+    When ARROW_DEFAULT_MEMORY_POOL=jemalloc is set (recommended),
+    this calls pa.jemalloc_set_decay_ms(0) to force jemalloc to
+    immediately return freed pages to the OS via madvise(MADV_DONTNEED).
+    This is the Arrow-team-recommended approach (apache/arrow#36378).
+
+    Without this, freed Arrow buffers stay in the allocator's cache
+    and RSS grows unboundedly across tasks.
     """
     global _worker_memory_initialized
     if _worker_memory_initialized:
         return
     _worker_memory_initialized = True
 
-    try:
-        import ctypes
-        import ctypes.util
+    import pyarrow as pa
 
-        # mimalloc symbols are linked into the process via pyarrow.
-        # ctypes.CDLL(None) exposes all symbols from the main executable
-        # and its loaded shared libraries.
-        proc = ctypes.CDLL(None)
-        mi_option_set = proc.mi_option_set
-        mi_option_set.argtypes = [ctypes.c_int, ctypes.c_long]
-        mi_option_set.restype = None
+    pool_name = pa.default_memory_pool().backend_name
 
-        # Enum values from mimalloc.h (v2.1.x).
-        # These must match the mimalloc version bundled with pyarrow.
-        MI_OPTION_PURGE_DELAY = 5
-        MI_OPTION_PURGE_DECOMMITS = 13
-
-        mi_option_set(MI_OPTION_PURGE_DELAY, 0)
-        mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1)
-
+    if pool_name == "jemalloc":
+        try:
+            pa.jemalloc_set_decay_ms(0)
+            _logger.info("Worker memory init: jemalloc decay_ms=0")
+        except Exception as e:
+            _logger.warning(f"Worker memory init: jemalloc_set_decay_ms failed: {e}")
+    else:
         _logger.info(
-            "Worker memory init: set mimalloc purge_delay=0, purge_decommits=1"
+            f"Worker memory init: pool={pool_name} (set "
+            f"ARROW_DEFAULT_MEMORY_POOL=jemalloc for aggressive page return)"
         )
-    except Exception as e:
-        _logger.warning(f"Worker memory init: failed to configure mimalloc: {e}")
 
 
 def get_rss_mb():
