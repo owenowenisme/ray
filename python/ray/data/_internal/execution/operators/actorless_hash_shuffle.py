@@ -121,7 +121,13 @@ def _shuffle_map(
         A tuple of ``(BlockMetadata, List[int], Dict)`` and the partition
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
+    import gc
+    import os
+
     rss_start = get_rss_mb()
+    arrow_start = pa.total_allocated_bytes() / (1024 * 1024)
+    pool_name = pa.default_memory_pool().backend_name
+    purge_delay = os.environ.get("MIMALLOC_PURGE_DELAY", "NOT SET")
 
     stats = BlockExecStats.builder()
 
@@ -155,11 +161,17 @@ def _shuffle_map(
     if any(col.num_chunks > 1 for col in block.columns):
         block = block.combine_chunks()
 
+    arrow_after_combine = pa.total_allocated_bytes() / (1024 * 1024)
+
     block_partitions = hash_partition(
         block, hash_cols=key_columns, num_partitions=num_partitions
     )
 
+    arrow_after_partition = pa.total_allocated_bytes() / (1024 * 1024)
+
     del block
+    gc.collect()
+    arrow_after_del_block = pa.total_allocated_bytes() / (1024 * 1024)
 
     shards = [None] * num_partitions
     non_empty_pids = []
@@ -170,15 +182,27 @@ def _shuffle_map(
             non_empty_pids.append(pid_key)
             shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
     del block_partitions
+    gc.collect()
 
+    arrow_after_del_parts = pa.total_allocated_bytes() / (1024 * 1024)
     rss_before_trim = get_rss_mb()
+
     release_memory()
+    pa.default_memory_pool().release_unused()
+
+    arrow_final = pa.total_allocated_bytes() / (1024 * 1024)
     rss_end = get_rss_mb()
 
     logger.info(
         f"Shuffle map memory: "
+        f"pool={pool_name}, MIMALLOC_PURGE_DELAY={purge_delay}, "
         f"rss={rss_start:.0f}->{rss_before_trim:.0f}->{rss_end:.0f}MB "
         f"(trimmed={rss_before_trim - rss_end:.0f}MB), "
+        f"arrow={arrow_start:.0f}->{arrow_after_combine:.0f}"
+        f"->{arrow_after_partition:.0f}"
+        f"->{arrow_after_del_block:.0f}"
+        f"->{arrow_after_del_parts:.0f}"
+        f"->{arrow_final:.0f}MB, "
         f"input={input_block_metadata.size_bytes / 1e6:.0f}MB, "
         f"blocks={len(blocks)}, partitions={num_partitions}"
     )
@@ -292,7 +316,7 @@ class ActorlessHashShuffleOperator(PhysicalOperator, SubProgressBarMixin):
        output blocks.
     """
 
-    _DEFAULT_MAP_TASK_NUM_CPUS = 1.0
+    _DEFAULT_MAP_TASK_NUM_CPUS = 4.5 # this force onlt one mapper worker to run on each node (better for profiling)
     _DEFAULT_COMPACTION_STRATEGY = "none"  # "none" | "pre_map_merge"
     _DEFAULT_PRE_MAP_MERGE_THRESHOLD = 1024 * 1024 * 1024  # 1 GB
     _DEFAULT_PRE_MAP_MERGE_NUM_PARTITIONS_THRESHOLD = 1000
