@@ -127,6 +127,12 @@ def _shuffle_map(
 
     init_worker_memory()
 
+    # Flush dirty pages from the previous task's post-serialization
+    # freed shards. jemalloc's decay_ms=0 only purges at the next
+    # allocation/epoch, not at free() time — so shards freed by Ray
+    # after serialization stay as dirty pages until we explicitly purge.
+    pa.default_memory_pool().release_unused()
+
     rss_start = get_rss_mb()
     arrow_start = pa.total_allocated_bytes() / (1024 * 1024)
     pool_name = pa.default_memory_pool().backend_name
