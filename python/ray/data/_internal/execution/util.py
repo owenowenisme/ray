@@ -14,15 +14,12 @@ _worker_memory_initialized = False
 
 
 def init_worker_memory():
-    """Configure Arrow's memory pool for aggressive page return.
+    """Switch Arrow to jemalloc with decay_ms=0 for aggressive page return.
 
-    When ARROW_DEFAULT_MEMORY_POOL=jemalloc is set (recommended),
-    this calls pa.jemalloc_set_decay_ms(0) to force jemalloc to
-    immediately return freed pages to the OS via madvise(MADV_DONTNEED).
+    Arrow's default allocator (mimalloc) retains freed pages across tasks,
+    causing private RSS to grow unboundedly. jemalloc with decay_ms=0
+    immediately returns freed pages to the OS via madvise(MADV_DONTNEED).
     This is the Arrow-team-recommended approach (apache/arrow#36378).
-
-    Without this, freed Arrow buffers stay in the allocator's cache
-    and RSS grows unboundedly across tasks.
     """
     global _worker_memory_initialized
     if _worker_memory_initialized:
@@ -31,19 +28,13 @@ def init_worker_memory():
 
     import pyarrow as pa
 
-    pool_name = pa.default_memory_pool().backend_name
-
-    if pool_name == "jemalloc":
-        try:
-            pa.jemalloc_set_decay_ms(0)
-            _logger.info("Worker memory init: jemalloc decay_ms=0")
-        except Exception as e:
-            _logger.warning(f"Worker memory init: jemalloc_set_decay_ms failed: {e}")
-    else:
-        _logger.info(
-            f"Worker memory init: pool={pool_name} (set "
-            f"ARROW_DEFAULT_MEMORY_POOL=jemalloc for aggressive page return)"
-        )
+    old_pool = pa.default_memory_pool().backend_name
+    try:
+        pa.set_memory_pool(pa.jemalloc_memory_pool())
+        pa.jemalloc_set_decay_ms(0)
+        _logger.info(f"Worker memory init: {old_pool}->jemalloc, decay_ms=0")
+    except Exception as e:
+        _logger.warning(f"Worker memory init: jemalloc setup failed: {e}")
 
 
 def get_memory_breakdown_mb():
