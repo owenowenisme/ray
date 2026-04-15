@@ -14,15 +14,8 @@ _worker_memory_initialized = False
 
 
 def init_worker_memory():
-    """One-time worker init: switch Arrow to system allocator and pin glibc's
-    mmap threshold low so large allocations use mmap instead of sbrk.
-
-    With the default dynamic threshold, glibc ratchets M_MMAP_THRESHOLD
-    upward after freeing large mmap'd chunks, causing subsequent large
-    allocations to land on the sbrk heap where they can't be returned
-    to the OS. Pinning it at 128 KB ensures every Arrow buffer (typically
-    many MB) goes through mmap and gets munmap'd on free() immediately —
-    no malloc_trim needed.
+    """One-time worker init: switch Arrow to system allocator and tune glibc
+    malloc to return freed pages to the OS more aggressively.
     """
     global _worker_memory_initialized
     if _worker_memory_initialized:
@@ -35,21 +28,60 @@ def init_worker_memory():
     if old_pool != "system":
         pa.set_memory_pool(pa.system_memory_pool())
 
+    mallopt_results = {}
     try:
         import ctypes
 
         libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.mallopt.restype = ctypes.c_int
+
         M_MMAP_THRESHOLD = -3
+        M_TRIM_THRESHOLD = -1
         M_ARENA_MAX = -8
-        libc.mallopt(M_MMAP_THRESHOLD, 128 * 1024)
-        libc.mallopt(M_ARENA_MAX, 2)
-    except (OSError, AttributeError):
-        pass
+
+        mallopt_results["mmap_thresh"] = libc.mallopt(M_MMAP_THRESHOLD, 128 * 1024)
+        mallopt_results["trim_thresh"] = libc.mallopt(M_TRIM_THRESHOLD, 128 * 1024)
+        mallopt_results["arena_max"] = libc.mallopt(M_ARENA_MAX, 2)
+    except (OSError, AttributeError) as e:
+        mallopt_results["error"] = str(e)
 
     _logger.info(
         f"Worker memory init: Arrow pool {old_pool}->system, "
-        f"M_MMAP_THRESHOLD=128KB, M_ARENA_MAX=2"
+        f"mallopt={mallopt_results}"
     )
+
+
+def get_rss_mb():
+    """Return current process RSS in MB."""
+    import os
+
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (FileNotFoundError, OSError):
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def release_memory():
+    """Force GC + return freed pages to OS via Arrow pool purge and malloc trim."""
+    import ctypes
+    import gc
+
+    import pyarrow as pa
+
+    gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def make_ref_bundles(simple_data: List[List[Any]]) -> List["RefBundle"]:

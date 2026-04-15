@@ -53,7 +53,7 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
-from ray.data._internal.execution.util import init_worker_memory
+from ray.data._internal.execution.util import get_rss_mb, init_worker_memory, release_memory
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.block import (
@@ -74,36 +74,6 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 BlockTransformer = Callable[[Block], Block]
-
-
-def _get_rss_mb():
-    """Return current process RSS in MB."""
-    import os
-
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except (FileNotFoundError, OSError):
-        import resource
-
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-
-
-def _release_memory():
-    """Force GC + return freed pages to OS via Arrow pool purge and malloc trim."""
-    import ctypes
-    import gc
-
-    gc.collect()
-    try:
-        pa.default_memory_pool().release_unused()
-    except Exception:
-        pass
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
 
 
 @ray.remote(max_calls=5)
@@ -139,7 +109,7 @@ def _shuffle_map(
         shards (``pa.Table``) or ``None`` for empty partitions.
     """
     init_worker_memory()
-    rss_start = _get_rss_mb()
+    rss_start = get_rss_mb()
 
     try:
         stats = BlockExecStats.builder()
@@ -192,9 +162,9 @@ def _shuffle_map(
                 shard_sizes[pid_key] = (shard.num_rows, shard.nbytes)
         del block_partitions
 
-        rss_before_trim = _get_rss_mb()
-        _release_memory()
-        rss_end = _get_rss_mb()
+        rss_before_trim = get_rss_mb()
+        release_memory()
+        rss_end = get_rss_mb()
 
         logger.info(
             f"Shuffle map memory: "
@@ -206,7 +176,7 @@ def _shuffle_map(
 
         return (input_block_metadata, non_empty_pids, shard_sizes), *shards
     finally:
-        _release_memory()
+        release_memory()
 
 
 @ray.remote
