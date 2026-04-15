@@ -127,10 +127,14 @@ def _shuffle_map(
 
     init_worker_memory()
 
-    # Flush dirty pages from the previous task's post-serialization
-    # freed shards. jemalloc's decay_ms=0 only purges at the next
-    # allocation/epoch, not at free() time — so shards freed by Ray
-    # after serialization stay as dirty pages until we explicitly purge.
+    # Force jemalloc to process pending frees from background threads
+    # (Ray's serialization may free shards on a different thread, leaving
+    # them in that thread's tcache). A small alloc+free on the main thread
+    # triggers jemalloc's cross-thread cache drain, then release_unused()
+    # purges the resulting dirty pages.
+    gc.collect()
+    buf = pa.allocate_buffer(1, memory_pool=pa.default_memory_pool())
+    del buf
     pa.default_memory_pool().release_unused()
 
     rss_start = get_rss_mb()
