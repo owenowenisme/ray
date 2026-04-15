@@ -68,8 +68,11 @@ def get_memory_breakdown_mb():
         vals = {}
         for line in data.splitlines():
             parts = line.split()
-            if len(parts) >= 2:
-                vals[parts[0].rstrip(":")] = int(parts[1])
+            if len(parts) >= 3 and parts[2] == "kB":
+                try:
+                    vals[parts[0].rstrip(":")] = int(parts[1])
+                except ValueError:
+                    continue
         rss = vals.get("Rss", 0) / 1024
         shared = (vals.get("Shared_Clean", 0) + vals.get("Shared_Dirty", 0)) / 1024
         private = (vals.get("Private_Clean", 0) + vals.get("Private_Dirty", 0)) / 1024
