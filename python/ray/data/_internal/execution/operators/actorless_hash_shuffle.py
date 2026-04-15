@@ -76,17 +76,15 @@ logger = logging.getLogger(__name__)
 BlockTransformer = Callable[[Block], Block]
 
 
-# runtime_env isolates shuffle map workers into a dedicated pool with
-# MALLOC_MMAP_THRESHOLD_ set at process startup.  This ensures:
-# 1. glibc uses mmap (not sbrk) for all allocations >128 KB, so free()
-#    calls munmap and returns pages to the OS immediately.
-# 2. ReadParquet / Project tasks never run on these workers (and vice
-#    versa), preventing cross-task RSS accumulation.
+# runtime_env isolates shuffle map workers into a dedicated pool and
+# configures mimalloc (Arrow's default allocator) to return freed pages
+# to the OS immediately instead of retaining them in its arenas.
+# MIMALLOC_PURGE_DELAY=0 forces synchronous madvise(MADV_DONTNEED) on
+# free, so RSS drops as soon as Arrow buffers are released.
 _SHUFFLE_MAP_RUNTIME_ENV = {
     "env_vars": {
-        "MALLOC_MMAP_THRESHOLD_": "131072",
-        "MALLOC_TRIM_THRESHOLD_": "131072",
-        "MALLOC_MMAP_MAX_": "-1",
+        "MIMALLOC_PURGE_DELAY": "0",
+        "MIMALLOC_ARENA_EAGER_COMMIT": "0",
     },
 }
 
