@@ -125,7 +125,16 @@ def _plan_write_op_internal(
     )
     transform_fns = pre_transforms + [write_transform] + post_transformations
 
-    map_transformer = MapTransformer(transform_fns)
+    # Mark this transformer as a datasink (split index = 0: all transforms
+    # belong to the datasink chain).  When it is fused with an upstream
+    # MapOperator the fused split index becomes len(map_fns), so the upstream
+    # map transforms run on the calling thread while the entire write chain
+    # (pre_write + write + stats) runs in a background thread.  This pipelines
+    # map compute with write I/O without any special-casing in the upstream op.
+    map_transformer = MapTransformer(
+        transform_fns,
+        datasink_transform_start_idx=0,
+    )
 
     # Set up on_start callback for datasinks.
     # This allows on_write_start to receive the schema from the first input bundle,
