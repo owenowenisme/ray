@@ -153,8 +153,8 @@ class MapTransformer:
             finally:
                 self._transformer._report_udf_time(time.perf_counter() - start)
 
-    # Sentinel object used to signal end-of-stream to the datasink write thread.
-    _WRITE_THREAD_DONE = object()
+    # Sentinel used to signal end-of-stream between pipeline threads.
+    _THREAD_DONE = object()
 
     def __init__(
         self,
@@ -163,6 +163,7 @@ class MapTransformer:
         init_fn: Optional[Callable[[], None]] = None,
         output_block_size_option_override: Optional[OutputBlockSizeOption] = None,
         datasink_transform_start_idx: Optional[int] = None,
+        source_transform_end_idx: Optional[int] = None,
     ):
         """
         Args:
@@ -175,6 +176,11 @@ class MapTransformer:
                 datasink transforms (write + stats collection).  When the transformer is
                 applied, a background thread runs the datasink chain while the upstream
                 transforms run on the calling thread, pipelining map compute with write I/O.
+            source_transform_end_idx: If set, transforms up to (not including) this index
+                are source transforms (e.g. file I/O reads).  When the transformer is
+                applied, a background thread runs the source chain and prefetches blocks
+                into a bounded queue while the downstream transforms run on the calling
+                thread, pipelining read I/O with downstream CPU compute.
         """
 
         self._transform_fns: List[MapTransformFn] = []
@@ -183,6 +189,8 @@ class MapTransformer:
         self._udf_time_s = 0
         # Index into _transform_fns where datasink transforms begin, or None.
         self._datasink_transform_start_idx: Optional[int] = datasink_transform_start_idx
+        # Index past the last source (I/O) transform, or None.
+        self._source_transform_end_idx: Optional[int] = source_transform_end_idx
 
         # Add transformations
         self.add_transform_fns(transform_fns)
@@ -239,6 +247,9 @@ class MapTransformer:
                 self.target_max_block_size_override
             )
 
+        if self._source_transform_end_idx is not None:
+            return self._apply_transform_with_read_thread(input_blocks, ctx)
+
         if self._datasink_transform_start_idx is not None:
             return self._apply_transform_with_write_thread(input_blocks, ctx)
 
@@ -287,7 +298,7 @@ class MapTransformer:
 
         def _run_datasink():
             """Pull blocks from the queue and drive the datasink transform chain."""
-            sentinel = MapTransformer._WRITE_THREAD_DONE
+            sentinel = MapTransformer._THREAD_DONE
 
             def _queued_iter() -> Iterator:
                 while True:
@@ -312,11 +323,11 @@ class MapTransformer:
                     block_queue.put(block)
             except BaseException:
                 # Upstream failed — signal the write thread to stop, then re-raise.
-                block_queue.put(MapTransformer._WRITE_THREAD_DONE)
+                block_queue.put(MapTransformer._THREAD_DONE)
                 write_future.result()
                 raise
             finally:
-                block_queue.put(MapTransformer._WRITE_THREAD_DONE)
+                block_queue.put(MapTransformer._THREAD_DONE)
 
             write_future.result()
 
@@ -324,6 +335,70 @@ class MapTransformer:
             raise write_exception[0]
 
         return iter(output_results)
+
+    def _apply_transform_with_read_thread(
+        self,
+        input_blocks: Iterable,
+        ctx: TaskContext,
+    ) -> Iterable:
+        """Pipeline upstream source (I/O) transforms with downstream transforms.
+
+        Source transforms (file reads, network fetches, etc.) run in a background
+        thread that prefetches blocks into a bounded queue.  The downstream
+        transforms (map, filter, write, …) run on the calling thread consuming
+        from that queue.  This pipelines read I/O with downstream CPU compute:
+        while the main thread is processing block N, the reader thread is already
+        fetching block N+1.
+
+        The queue size (2 slots) limits how far ahead the reader can get, keeping
+        peak memory bounded to roughly 2× block size.
+        """
+        split = self._source_transform_end_idx
+        source_fns = self._transform_fns[:split]
+        downstream_fns = self._transform_fns[split:]
+
+        sentinel = MapTransformer._THREAD_DONE
+        block_queue: Queue = Queue(maxsize=2)
+        read_exception: List[BaseException] = []
+
+        def _run_source():
+            """Run source transforms and feed results into the queue."""
+            try:
+                it = input_blocks
+                for fn in source_fns:
+                    it = fn(it, ctx)
+                    if getattr(fn, "_is_udf", False):
+                        it = self._UDFTimingIterator(it, self)
+                for block in it:
+                    block_queue.put(block)
+            except BaseException as exc:
+                read_exception.append(exc)
+            finally:
+                block_queue.put(sentinel)
+
+        def _queued_source() -> Iterator:
+            while True:
+                item = block_queue.get()
+                if item is sentinel:
+                    return
+                yield item
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(_run_source)
+
+            # Apply downstream transforms on the calling thread.
+            it = _queued_source()
+            for fn in downstream_fns:
+                it = fn(it, ctx)
+                if getattr(fn, "_is_udf", False):
+                    it = self._UDFTimingIterator(it, self)
+
+            results = list(it)
+
+        if read_exception:
+            raise read_exception[0]
+
+        return iter(results)
 
     def fuse(self, other: "MapTransformer") -> "MapTransformer":
         """Fuse two `MapTransformer`s together."""
@@ -357,8 +432,14 @@ class MapTransformer:
                 len(self._transform_fns) + other._datasink_transform_start_idx
             )
         elif self._datasink_transform_start_idx is not None:
-            # Unusual: upstream is already a datasink — keep its index.
             fused_datasink_idx = self._datasink_transform_start_idx
+
+        # Propagate the source transform end index.  If `self` (the upstream
+        # operator) is a source, its index is unchanged in the fused chain.
+        fused_source_idx: Optional[int] = None
+        if self._source_transform_end_idx is not None:
+            fused_source_idx = self._source_transform_end_idx
+        # `other` being a source after fusion is unusual; ignore it.
 
         transformer = MapTransformer(
             combined_transform_fns,
@@ -370,6 +451,7 @@ class MapTransformer:
                 ),
             ),
             datasink_transform_start_idx=fused_datasink_idx,
+            source_transform_end_idx=fused_source_idx,
         )
 
         return transformer
