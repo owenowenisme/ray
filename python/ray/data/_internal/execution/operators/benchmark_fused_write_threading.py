@@ -125,6 +125,102 @@ def run_unit_benchmark(
 
 
 # ---------------------------------------------------------------------------
+# Unit-level benchmark — read (I/O) + map (CPU) pipelining
+# ---------------------------------------------------------------------------
+
+
+def _run_unit_read(n_blocks: int, io_ms: float, cpu_ms: float, threaded: bool) -> float:
+    """Measure time for a chain of [read_fn, map_fn] where read is I/O-bound.
+
+    read_fn sleeps for io_ms  (simulates reading a block from disk/S3).
+    map_fn  sleeps for cpu_ms (simulates CPU-bound processing).
+
+    With threading (prefetch): reader runs ahead in background, feeding a queue.
+      Main thread processes block N while reader fetches block N+1.
+      Total ≈ n_blocks * max(io_ms, cpu_ms)  (startup cost for first block aside)
+
+    Without threading: serial read → process → read → process → ...
+      Total ≈ n_blocks * (io_ms + cpu_ms)
+
+    This is the REVERSE pattern of write threading:
+      write: main thread produces (CPU), background thread writes (I/O)
+      read:  background thread reads (I/O), main thread processes (CPU)
+    """
+    from ray.data._internal.execution.interfaces.task_context import TaskContext
+    from ray.data._internal.execution.operators.map_transformer import MapTransformer
+
+    ctx = TaskContext(task_idx=0, op_name="bench")
+
+    def _sleep_fn(delay_s):
+        def _fn(items, ctx):
+            for item in items:
+                time.sleep(delay_s)
+                yield item
+        return _fn
+
+    read_callable = _sleep_fn(io_ms / 1000)
+    map_callable = _sleep_fn(cpu_ms / 1000)
+    for fn in (read_callable, map_callable):
+        fn._is_udf = False
+
+    blocks = list(range(n_blocks))
+
+    t0 = time.perf_counter()
+    if threaded:
+        transformer = MapTransformer.__new__(MapTransformer)
+        transformer._transform_fns = [read_callable, map_callable]
+        transformer._init_fn = lambda: None
+        transformer._output_block_size_option_override = None
+        transformer._udf_time_s = 0
+        transformer._datasink_transform_start_idx = None
+        transformer._source_transform_end_idx = 1  # read_fn is the source
+        list(transformer._apply_transform_with_read_thread(iter(blocks), ctx))
+    else:
+        result = iter(blocks)
+        for fn in [read_callable, map_callable]:
+            result = fn(result, ctx)
+        list(result)
+    return time.perf_counter() - t0
+
+
+def run_unit_read_benchmark(
+    n_blocks: int = 8,
+    io_ms: float = 60.0,
+    cpu_ms: float = 80.0,
+    repeats: int = 3,
+):
+    print("=" * 60)
+    print("Unit benchmark — read (I/O) + map (CPU) prefetch threading")
+    print(f"  {n_blocks} blocks, read={io_ms}ms/block, map={cpu_ms}ms/block")
+    print(
+        f"  theoretical: sequential={n_blocks*(io_ms+cpu_ms):.0f}ms, "
+        f"threaded≈{n_blocks*max(io_ms,cpu_ms):.0f}ms"
+    )
+    print("-" * 60)
+
+    seq_times, thr_times = [], []
+    for rep in range(repeats):
+        s = _run_unit_read(n_blocks, io_ms, cpu_ms, threaded=False)
+        t = _run_unit_read(n_blocks, io_ms, cpu_ms, threaded=True)
+        seq_times.append(s)
+        thr_times.append(t)
+        print(
+            f"  rep {rep+1}: sequential={s*1000:.0f}ms  "
+            f"threaded={t*1000:.0f}ms  speedup={s/t:.2f}x"
+        )
+
+    avg_s = sum(seq_times) / len(seq_times)
+    avg_t = sum(thr_times) / len(thr_times)
+    print("-" * 60)
+    print(
+        f"  avg:     sequential={avg_s*1000:.0f}ms  "
+        f"threaded={avg_t*1000:.0f}ms  speedup={avg_s/avg_t:.2f}x"
+    )
+    print()
+    return avg_s, avg_t
+
+
+# ---------------------------------------------------------------------------
 # End-to-end benchmark — requires Ray
 # ---------------------------------------------------------------------------
 
@@ -241,6 +337,12 @@ def main():
         n_blocks=args.blocks,
         cpu_ms=args.cpu_ms,
         io_ms=args.io_ms,
+        repeats=args.repeats,
+    )
+    run_unit_read_benchmark(
+        n_blocks=args.blocks,
+        io_ms=args.io_ms,
+        cpu_ms=args.cpu_ms,
         repeats=args.repeats,
     )
 
