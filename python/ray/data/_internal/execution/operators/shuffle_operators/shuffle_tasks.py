@@ -1,8 +1,10 @@
 """Shared remote tasks + helpers for ShuffleMapOp / ShuffleReduceOp."""
 
+import os
 import pickle
 import time
-from dataclasses import replace
+import uuid
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -25,6 +27,49 @@ from ray.data.block import (
 
 PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[Block]]
+
+
+@dataclass(frozen=True)
+class _ShardHandle:
+    """Locates one partition's shard inside a mapper's on-disk shard file.
+
+    Map tasks write all of their partition shards into a single local file and
+    return one of these per partition instead of the shard bytes themselves, so
+    the (num_mappers * num_partitions) intermediate shards never occupy the
+    object store -- they live on local disk and reduce tasks read them back
+    directly via this byte range.
+    """
+
+    path: str
+    offset: int
+    length: int
+
+
+def _write_shards_to_file(
+    shard_dir: str, partition_bufs: List[pa.Buffer]
+) -> List[_ShardHandle]:
+    """Write one mapper's partition shards into a single file under shard_dir.
+
+    Returns one handle per partition (in partition-id order) pointing at its
+    byte range within the file.
+    """
+    os.makedirs(shard_dir, exist_ok=True)
+    path = os.path.join(shard_dir, f"{uuid.uuid4().hex}.shards")
+    handles: List[_ShardHandle] = []
+    with open(path, "wb") as f:
+        for buf in partition_bufs:
+            offset = f.tell()
+            f.write(memoryview(buf))
+            handles.append(_ShardHandle(path=path, offset=offset, length=len(buf)))
+    return handles
+
+
+def _read_shard_from_file(handle: _ShardHandle) -> pa.Buffer:
+    """Read one shard's IPC bytes back from its mapper's on-disk shard file."""
+    with open(handle.path, "rb", buffering=0) as f:
+        f.seek(handle.offset)
+        data = f.read(handle.length)
+    return pa.py_buffer(data)
 
 
 def _ipc_write_options(compression: Optional[str]) -> pa.ipc.IpcWriteOptions:
@@ -96,8 +141,12 @@ def _shuffle_map_task(
     partition_fn: PartitionFn,
     num_partitions: int,
     compression: Optional[str],
+    shard_dir: str,
 ):
-    """Map stage: partition the input blocks and return one shard per partition."""
+    """Map stage: partition the input blocks, write one shard per partition to
+    a single local file under ``shard_dir``, and return one ``_ShardHandle`` per
+    partition (plus metadata) rather than the shard bytes -- keeping the
+    intermediate shuffle data off the object store."""
     stats = BlockExecStats.builder()
 
     # Use BlockAccessor so we also work for non-Arrow blocks (pandas, numpy)
@@ -127,11 +176,15 @@ def _shuffle_map_task(
         partition_bufs.append(_encode_partition_ipc(merged, ipc_write_options))
         del merged
 
+    # Spill the shards to local disk and return lightweight handles instead of
+    # the shard buffers, so the intermediate data never enters the object store.
+    handles = _write_shards_to_file(shard_dir, partition_bufs)
+
     input_meta = BlockAccessor.for_block(blocks[0]).get_metadata(
         block_exec_stats=stats.build(block_ser_time_s=0),
     )
     input_meta = replace(input_meta, num_rows=total_rows, size_bytes=total_bytes)
-    return (input_meta, shard_sizes, output_schema), *partition_bufs
+    return (input_meta, shard_sizes, output_schema), *handles
 
 
 def _read_partition_ipc(buf: pa.Buffer) -> Optional[pa.Table]:
@@ -170,8 +223,11 @@ def _shuffle_reduce_task(
     whole partition (sort, aggregate).
 
     Args:
-        shard_refs: ObjectRefs to this partition's IPC shards from every mapper.
-            May contain None for mappers that produced no rows here.
+        shard_refs: ObjectRefs to this partition's `_ShardHandle`s, one per
+            mapper. Each handle locates the shard's IPC bytes on local disk,
+            which this task reads back directly (the shard bytes themselves
+            never enter the object store). May contain None for mappers that
+            produced no rows here.
         partition_id: Partition this reducer owns.
         reduce_fn: User-supplied reduce callable.
         target_max_block_size: Output block size, and the streaming flush
@@ -222,10 +278,10 @@ def _shuffle_reduce_task(
     # flush through reduce_fn and yield any ready output blocks.
     for batch_start in range(0, len(shard_refs), batch_size):
         batch = shard_refs[batch_start : batch_start + batch_size]
-        for buf in ray.get(batch):
-            if buf is None:
+        for handle in ray.get(batch):
+            if handle is None:
                 continue
-            table = _read_partition_ipc(buf)
+            table = _read_partition_ipc(_read_shard_from_file(handle))
             if table is None:
                 continue
             accum_tables.append(table)

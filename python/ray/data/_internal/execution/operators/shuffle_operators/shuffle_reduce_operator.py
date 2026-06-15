@@ -1,5 +1,6 @@
 import functools
 import logging
+import shutil
 import typing
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -271,6 +272,12 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
                 f"Reduce of partition {partition_id} failed: {exc}", exc_info=exc
             )
 
+        # Each map shard file holds shards for every partition, so a file is
+        # only fully consumed once every reducer has run. Drain the whole shard
+        # dir once the last reduce task finishes.
+        if self._inputs_complete and not self._shuffle_reduce_tasks:
+            self._cleanup_shard_dir()
+
     def has_execution_finished(self) -> bool:
         if self._shuffle_reduce_tasks or self._output_queue:
             return False
@@ -283,8 +290,15 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             and super().has_completed()
         )
 
+    def _cleanup_shard_dir(self) -> None:
+        """Remove the upstream map op's on-disk shard files."""
+        upstream = self.input_dependencies[0]
+        if isinstance(upstream, ShuffleMapOp):
+            shutil.rmtree(upstream.get_shard_dir(), ignore_errors=True)
+
     def _do_shutdown(self, force: bool = False) -> None:
         super()._do_shutdown(force)
+        self._cleanup_shard_dir()
         self._shuffle_reduce_tasks.clear()
         self._output_queue.clear()
 

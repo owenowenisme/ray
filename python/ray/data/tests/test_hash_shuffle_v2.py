@@ -170,6 +170,61 @@ def test_repartition_with_sort_produces_sorted_partitions(
             assert ids == sorted(ids)
 
 
+def test_shard_file_round_trip(tmp_path):
+    """Map shards written to disk decode back to the original table."""
+    import pyarrow as pa
+
+    from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (  # noqa: E501
+        _encode_partition_ipc,
+        _ipc_write_options,
+        _read_partition_ipc,
+        _read_shard_from_file,
+        _write_shards_to_file,
+    )
+
+    opts = _ipc_write_options("zstd")
+    tables = [
+        pa.table({"id": list(range(10)), "v": [i * 2 for i in range(10)]}),
+        pa.table({"id": [], "v": []}),  # empty partition shard
+        pa.table({"id": [99], "v": [-1]}),
+    ]
+    bufs = [_encode_partition_ipc(t, opts) for t in tables]
+
+    handles = _write_shards_to_file(str(tmp_path), bufs)
+    assert len(handles) == len(tables)
+    # All shards share one file; ranges are non-overlapping and in order.
+    assert len({h.path for h in handles}) == 1
+    assert [h.offset for h in handles] == sorted(h.offset for h in handles)
+
+    for handle, original in zip(handles, tables):
+        decoded = _read_partition_ipc(_read_shard_from_file(handle))
+        assert decoded.to_pydict() == original.to_pydict()
+
+
+def test_shard_files_cleaned_up_after_materialize(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """The on-disk shard staging dir is removed once the shuffle completes."""
+    import os
+
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(200, override_num_blocks=4)
+    ds.repartition(4, keys=["id"]).materialize()
+
+    session_dir = ray._private.worker._global_node.get_session_dir_path()
+    shard_root = os.path.join(session_dir, "ray_data_shuffle")
+    leftover = []
+    for dirpath, _dirnames, filenames in os.walk(shard_root):
+        for f in filenames:
+            if f.endswith(".shards"):
+                leftover.append(os.path.join(dirpath, f))
+    assert not leftover, f"shard files not cleaned up: {leftover}"
+
+
 if __name__ == "__main__":
     import sys
 

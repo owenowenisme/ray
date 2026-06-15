@@ -1,7 +1,10 @@
 import dataclasses
 import functools
 import logging
+import os
+import shutil
 import typing
+import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,6 +107,17 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
+
+        # -- Local-disk shard staging ----------------------------------------
+        # Map shards are written to local disk under the Ray session dir and
+        # read back directly by reduce tasks instead of being materialized as
+        # object-store objects. (Tier 1: a single shared local dir, which works
+        # on a single node; multi-node needs per-node dirs + a fetch path.)
+        session_dir = ray._private.worker._global_node.get_session_dir_path()
+        self._shard_dir: str = os.path.join(
+            session_dir, "ray_data_shuffle", uuid.uuid4().hex
+        )
+        os.makedirs(self._shard_dir, exist_ok=True)
 
         # -- Map task config -------------------------------------------------
         self._shuffle_map_task_num_cpus: float = map_cpus
@@ -239,6 +253,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
             compression=self.data_context.hash_shuffle_compression,
+            shard_dir=self._shard_dir,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])
@@ -380,6 +395,10 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
     def get_partition_bytes(self) -> Dict[int, int]:
         return dict(self._partition_bytes)
 
+    def get_shard_dir(self) -> str:
+        """Local directory holding this shuffle's on-disk map shards."""
+        return self._shard_dir
+
     def get_active_tasks(self) -> List[OpTask]:
         return list(self._shuffle_map_tasks.values())
 
@@ -404,6 +423,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _do_shutdown(self, force: bool = False) -> None:
         super()._do_shutdown(force)
+        # Safety net: reduce drains the shard dir on completion, but on an
+        # aborted run remove the on-disk shards here too.
+        shutil.rmtree(self._shard_dir, ignore_errors=True)
         self._shuffle_map_tasks.clear()
         self._merge_buffer_refs_by_node.clear()
         for bundles in self._merge_buffer_bundles_by_node.values():
