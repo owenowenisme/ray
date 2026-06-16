@@ -1,9 +1,11 @@
-from typing import List
+import os
+from typing import List, Optional
 
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
+from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.hash_shuffle_v2 import (
     _SHUFFLE_MAP_RUNTIME_ENV,
     _concat_reduce,
@@ -81,12 +83,29 @@ def _plan_hash_shuffle_repartition(
     partition_fn = _make_hash_partition_fn(key_list, target_num_partitions)
     reduce_fn = _sort_reduce(key_list) if logical_op.sort else _concat_reduce
 
+    # PROTOTYPE: fuse a Limit sitting directly upstream of the shuffle into the
+    # map phase.  Map tasks claim a slice of a shared global row budget before
+    # partitioning (see distributed_limit_counter), so we skip materializing the
+    # limited dataset as its own stage.  Gated behind an env flag while we
+    # validate the approach; off by default leaves the LimitOperator in place.
+    fuse_limit = os.environ.get("RAY_DATA_FUSE_LIMIT_INTO_SHUFFLE") == "1"
+    limit: Optional[int] = None
+    if fuse_limit and isinstance(input_physical_op, LimitOperator):
+        limit = input_physical_op._limit
+        # Bypass the LimitOperator: feed the shuffle directly from the limit's
+        # own upstream.
+        input_physical_op = input_physical_op.input_dependencies[0]
+        input_logical_op = input_physical_op._logical_operators[0]
+        estimated_input_blocks = input_logical_op.estimated_num_outputs()
+
     map_op = ShuffleMapOp(
         input_physical_op,
         data_context,
         num_partitions=target_num_partitions,
         partition_fn=partition_fn,
+        pre_map_merge_threshold=data_context.hash_shuffle_pre_map_merge_threshold,
         map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
+        limit=limit,
         name=(
             f"HashShuffleMap(keys={tuple(key_list)}, "
             f"partitions={target_num_partitions})"

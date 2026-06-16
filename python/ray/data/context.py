@@ -105,6 +105,34 @@ DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE = env_integer(
     "RAY_DATA_HASH_SHUFFLE_REDUCE_BATCH_SIZE", 16
 )
 
+# Per-node byte threshold at which buffered upstream blocks are merged into a
+# single hash-shuffle map task. Larger = fewer, bigger map tasks (less overhead)
+# but more tail latency, since sub-threshold remainders only flush once upstream
+# is fully done. Set to 0 to submit a map task per input bundle (no merging).
+DEFAULT_HASH_SHUFFLE_PRE_MAP_MERGE_THRESHOLD = env_integer(
+    "RAY_DATA_HASH_SHUFFLE_PRE_MAP_MERGE_THRESHOLD", 1024 * 1024 * 1024
+)
+
+# When in-flight hash-shuffle map tasks drop to/below this floor while blocks are
+# still buffered, flush the largest buffer early (even below the merge threshold)
+# so freed map workers don't idle waiting for a full batch or for upstream to
+# finish. 0 keeps the original behavior (partials flush only when fully idle).
+# Set below the steady-state map concurrency so it only fires during ramp-up and
+# the upstream wind-down, leaving steady-state batches at the full threshold.
+DEFAULT_HASH_SHUFFLE_MIN_INFLIGHT_MAP_TASKS = env_integer(
+    "RAY_DATA_HASH_SHUFFLE_MIN_INFLIGHT_MAP_TASKS", 0
+)
+
+# Max seconds a partial hash-shuffle map buffer may sit before it is flushed
+# even though it hasn't reached the merge threshold. Bounds the read->map tail:
+# under load buffers reach the threshold first (size flush); during upstream
+# wind-down they age out (time flush) instead of waiting for upstream to finish.
+# 0.0 disables the age-based flush. Concurrency-independent, unlike the in-flight
+# floor. A value a few times smaller than the map task runtime is a good start.
+DEFAULT_HASH_SHUFFLE_MAX_MERGE_LINGER_S = env_float(
+    "RAY_DATA_HASH_SHUFFLE_MAX_MERGE_LINGER_S", 0.0
+)
+
 DEFAULT_SCHEDULING_STRATEGY = "SPREAD"
 
 # This default enables locality-based scheduling in Ray for tasks where arg data
@@ -636,6 +664,26 @@ class DataContext:
             shuffle operations if the number of partitions is unspecifed.
         hash_shuffle_compression: Codec used to compress hash-shuffle
             intermediate shards: "none", "lz4", or "zstd" (default "zstd").
+        hash_shuffle_pre_map_merge_threshold: Per-node byte threshold at which
+            buffered upstream blocks are merged into a single hash-shuffle map
+            task. Larger values create fewer, larger map tasks but add tail
+            latency (sub-threshold remainders only flush once upstream is done).
+            ``0`` disables merging (one map task per input bundle).
+        hash_shuffle_min_inflight_map_tasks: In-flight map-task floor for the
+            hash-shuffle map stage. When the number of running map tasks drops
+            to/below this value while upstream blocks are still buffered, the
+            largest buffer is flushed early (even below
+            ``hash_shuffle_pre_map_merge_threshold``) so freed workers don't idle
+            waiting for a full batch or for upstream to finish. Keep it below the
+            steady-state map concurrency so steady-state batches stay full-sized;
+            ``0`` only flushes partials once the stage is fully idle.
+        hash_shuffle_max_merge_linger_s: Maximum seconds a partial map buffer may
+            sit before it is flushed even below
+            ``hash_shuffle_pre_map_merge_threshold``. Bounds the read→map tail:
+            under load buffers reach the threshold first (size flush); during the
+            upstream wind-down they age out (time flush) rather than waiting for
+            upstream to finish. Unlike the in-flight floor this needs no
+            knowledge of map concurrency. ``0.0`` disables it.
         hash_shuffle_reduce_batch_size: Number of shard object references each
             hash-shuffle reduce task dereferences per ``ray.get()`` call.
         max_hash_shuffle_aggregators: Maximum number of aggregating actors that can be
@@ -728,6 +776,21 @@ class DataContext:
 
     # Shard refs each reduce task dereferences per ray.get() call.
     hash_shuffle_reduce_batch_size: int = DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE
+
+    # Per-node byte threshold for merging buffered blocks into one map task.
+    hash_shuffle_pre_map_merge_threshold: int = (
+        DEFAULT_HASH_SHUFFLE_PRE_MAP_MERGE_THRESHOLD
+    )
+
+    # In-flight map-task floor below which buffered partials are flushed early to
+    # keep map workers fed during ramp-up / upstream wind-down.
+    hash_shuffle_min_inflight_map_tasks: int = (
+        DEFAULT_HASH_SHUFFLE_MIN_INFLIGHT_MAP_TASKS
+    )
+
+    # Max seconds a partial map buffer may sit before being flushed below the
+    # merge threshold (age-based tail flush). 0.0 disables it.
+    hash_shuffle_max_merge_linger_s: float = DEFAULT_HASH_SHUFFLE_MAX_MERGE_LINGER_S
 
     # Max number of aggregators (actors) that could be provisioned
     # to perform aggregations on partitions produced during hash-shuffling

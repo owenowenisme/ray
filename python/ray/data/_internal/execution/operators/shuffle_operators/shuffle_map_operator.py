@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import time
 import typing
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,6 +95,8 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         pre_map_merge_threshold: int = _DEFAULT_PRE_MAP_MERGE_THRESHOLD,
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
+        limit: Optional[int] = None,
+        limit_offset: int = 0,
         name: str = "ShuffleMap",
     ):
         super().__init__(
@@ -105,12 +108,34 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
 
+        # -- Fused limit -----------------------------------------------------
+        # When set, a Limit was fused into this shuffle: map tasks claim a slice
+        # of a shared global row budget (held by a counter actor) before
+        # partitioning.  The actor is created lazily on first input, since Ray
+        # is not necessarily initialized at plan/construction time.
+        self._limit: Optional[int] = limit
+        self._limit_offset: int = limit_offset
+        self._limit_actor: Optional["ray.actor.ActorHandle"] = None
+        # Set once a completed map task reports the global budget is spent; lets
+        # us drop the input tail instead of partitioning rows we'd discard.
+        self._limit_done: bool = False
+
         # -- Map task config -------------------------------------------------
         self._shuffle_map_task_num_cpus: float = map_cpus
         self._map_runtime_env: Optional[Dict[str, Any]] = map_runtime_env
 
         # -- Pre-map merge ---------------------------------------------------
         self._pre_map_merge_threshold: int = pre_map_merge_threshold
+        # Flush buffered partials early when in-flight map tasks fall to/below
+        # this floor, so workers don't idle through ramp-up / upstream wind-down.
+        self._min_inflight_map_tasks: int = (
+            data_context.hash_shuffle_min_inflight_map_tasks
+        )
+        # Max seconds a partial buffer may sit before being flushed below the
+        # merge threshold (age-based tail flush; 0 disables).
+        self._max_merge_linger_s: float = (
+            data_context.hash_shuffle_max_merge_linger_s
+        )
         self._merge_buffer_refs_by_node: Dict[
             str, List[ObjectRef[Block]]
         ] = defaultdict(list)
@@ -118,6 +143,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._merge_buffer_bundles_by_node: Dict[str, List[RefBundle]] = defaultdict(
             list
         )
+        # Monotonic timestamp when each node's buffer received its first block
+        # (since the last flush). Drives the age-based linger flush.
+        self._merge_buffer_first_add_s: Dict[str, float] = {}
 
         # -- Map task tracking -----------------------------------------------
         self._next_shuffle_map_task_idx: int = 0
@@ -154,12 +182,30 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         queues.append(self._output_queue)
         return queues
 
+    def _ensure_limit_actor(self) -> None:
+        if self._limit is not None and self._limit_actor is None:
+            from ray.data._internal.execution.operators.shuffle_operators.distributed_limit_counter import (  # noqa: E501
+                make_limit_counter_actor,
+            )
+
+            self._limit_actor = make_limit_counter_actor(
+                self._limit, self._limit_offset
+            )
+
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         assert input_index == 0
 
         if not refs.block_refs:
             refs.destroy_if_owned()
             return
+
+        # Fused limit already satisfied by other tasks: drop the tail.  Any rows
+        # here would claim 0 from the actor anyway, so discarding is exact.
+        if self._limit_done:
+            refs.destroy_if_owned()
+            return
+
+        self._ensure_limit_actor()
 
         if self._pre_map_merge_threshold > 0:
             preferred_locs = refs.get_preferred_object_locations()
@@ -169,6 +215,8 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 else "unknown"
             )
 
+            if node_id not in self._merge_buffer_first_add_s:
+                self._merge_buffer_first_add_s[node_id] = time.monotonic()
             for block_ref, block_metadata in zip(refs.block_refs, refs.metadata):
                 self._merge_buffer_refs_by_node[node_id].append(block_ref)
                 self._merge_buffer_bytes_by_node[node_id] += (
@@ -181,12 +229,54 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 >= self._pre_map_merge_threshold
             ):
                 self._flush_merge_buffer(node_id)
+            else:
+                # Below threshold: flush partials that have lingered too long, and
+                # (as a backstop) the largest buffer if map workers are starving,
+                # rather than holding everything until upstream is done.
+                self._flush_aged_buffers()
+                self._flush_for_idle_workers()
         else:
             self._submit_shuffle_map_task(
                 list(refs.block_refs),
                 [refs],
                 estimated_bytes=sum((m.size_bytes or 0) for m in refs.metadata),
             )
+
+    def _flush_aged_buffers(self) -> None:
+        """Flush buffers whose oldest block has lingered past the linger bound.
+
+        Concurrency-independent: under load a buffer reaches the merge threshold
+        (and flushes by size) before aging out, so this only fires for buffers
+        that fill slowly -- i.e. during the upstream wind-down -- bounding how
+        long any partial waits instead of holding it until ``all_inputs_done``.
+        """
+        if self._max_merge_linger_s <= 0:
+            return
+        now = time.monotonic()
+        for node_id in list(self._merge_buffer_first_add_s.keys()):
+            first_add = self._merge_buffer_first_add_s.get(node_id)
+            if first_add is not None and now - first_add >= self._max_merge_linger_s:
+                self._flush_merge_buffer(node_id)
+
+    def _flush_for_idle_workers(self) -> None:
+        """Flush largest buffers early while map workers sit below the floor.
+
+        Steady-state in-flight is well above the floor, so this only fires during
+        ramp-up and the upstream wind-down -- exactly when freed workers would
+        otherwise idle waiting for a full batch (or for ``all_inputs_done``).
+        Steady-state batches are unaffected, so shard count stays low.
+        """
+        while (
+            len(self._shuffle_map_tasks) <= self._min_inflight_map_tasks
+            and self._merge_buffer_bytes_by_node
+        ):
+            node_id = max(
+                self._merge_buffer_bytes_by_node,
+                key=self._merge_buffer_bytes_by_node.get,
+            )
+            if self._merge_buffer_bytes_by_node[node_id] <= 0:
+                break
+            self._flush_merge_buffer(node_id)
 
     def all_inputs_done(self) -> None:
         super().all_inputs_done()
@@ -198,6 +288,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         block_refs = self._merge_buffer_refs_by_node.pop(node_id, [])
         bundles = self._merge_buffer_bundles_by_node.pop(node_id, [])
         estimated_bytes = self._merge_buffer_bytes_by_node.pop(node_id, 0)
+        self._merge_buffer_first_add_s.pop(node_id, None)
         if not block_refs:
             for bundle in bundles:
                 bundle.destroy_if_owned()
@@ -239,6 +330,8 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
             compression=self.data_context.hash_shuffle_compression,
+            limit_actor=self._limit_actor,
+            limit_task_id=cur_task_idx,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])
@@ -289,7 +382,11 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         # `task_done_callback` fires only after the metadata ref is ready,
         # so this is just local deserialization.
-        input_meta, shard_sizes, output_schema = ray.get(task.get_waitable())
+        input_meta, shard_sizes, output_schema, limit_done = ray.get(
+            task.get_waitable()
+        )
+        if limit_done:
+            self._limit_done = True
 
         for partition_id, ref in enumerate(partition_refs):
             rows, nbytes = shard_sizes.get(partition_id, (0, 0))
@@ -323,6 +420,12 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         if self._map_bar is not None:
             self._map_bar.update(increment=input_meta.num_rows or 0)
+
+        # A worker just freed up; if upstream has gone quiet, flush lingering /
+        # starved buffers instead of waiting for all_inputs_done.
+        if not self._inputs_complete:
+            self._flush_aged_buffers()
+            self._flush_for_idle_workers()
 
         self._maybe_emit_partition_bundles()
 
@@ -411,6 +514,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 bundle.destroy_if_owned()
         self._merge_buffer_bundles_by_node.clear()
         self._merge_buffer_bytes_by_node.clear()
+        self._merge_buffer_first_add_s.clear()
         for queue in self._partition_staging.values():
             queue.clear()
         self._output_queue.clear()

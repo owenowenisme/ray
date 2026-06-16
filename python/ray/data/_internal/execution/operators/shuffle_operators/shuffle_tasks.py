@@ -1,5 +1,7 @@
 """Shared remote tasks + helpers for ShuffleMapOp / ShuffleReduceOp."""
 
+import logging
+import os
 import pickle
 import time
 from dataclasses import replace
@@ -23,8 +25,27 @@ from ray.data.block import (
     TaskExecWorkerStats,
 )
 
+logger = logging.getLogger(__name__)
+
+# Set RAY_DATA_PROFILE_SHUFFLE_REDUCE=1 to log a per-reduce-task timing
+# breakdown (shard fetch/restore vs decode vs reduce+emit).
+_PROFILE_REDUCE = bool(int(os.environ.get("RAY_DATA_PROFILE_SHUFFLE_REDUCE", "0")))
+
 PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[Block]]
+
+# When RAY_DATA_LOG_MAP_WORKER_IDLE=1, each map task logs how long this worker
+# sat idle since it finished its previous map task.  Map workers are reused
+# (the task has no max_calls), so this measures the read->map delivery gap:
+# idle ~0 means the worker ran back-to-back (map is throughput/CPU-bound), large
+# idle means the worker waited for input between tasks (map is starved).
+_LOG_MAP_WORKER_IDLE = bool(int(os.environ.get("RAY_DATA_LOG_MAP_WORKER_IDLE", "0")))
+# Per-worker-process timestamp (monotonic) of when this worker's previous map
+# task finished. None until this worker has run one map task.
+_LAST_MAP_TASK_END_S: Optional[float] = None
+# Running totals per worker, so the gap can be read as a fraction of wall time.
+_MAP_TASK_COUNT: int = 0
+_MAP_IDLE_TOTAL_S: float = 0.0
 
 
 def _ipc_write_options(compression: Optional[str]) -> pa.ipc.IpcWriteOptions:
@@ -96,20 +117,59 @@ def _shuffle_map_task(
     partition_fn: PartitionFn,
     num_partitions: int,
     compression: Optional[str],
+    limit_actor: Optional["ray.actor.ActorHandle"] = None,
+    limit_task_id: Optional[int] = None,
 ):
-    """Map stage: partition the input blocks and return one shard per partition."""
+    """Map stage: partition the input blocks and return one shard per partition.
+
+    When ``limit_actor`` is set, a ``Limit`` has been fused into this shuffle:
+    before partitioning, the task claims a slice of the global row budget from
+    the counter actor and truncates its blocks accordingly, so the union of all
+    map outputs respects the limit.  ``limit_done`` is returned in the metadata
+    tuple so the operator can stop submitting tasks once the budget is spent.
+    """
+    if _LOG_MAP_WORKER_IDLE:
+        global _LAST_MAP_TASK_END_S, _MAP_TASK_COUNT, _MAP_IDLE_TOTAL_S
+        _task_start_s = time.monotonic()
+        if _LAST_MAP_TASK_END_S is not None:
+            idle_s = _task_start_s - _LAST_MAP_TASK_END_S
+            _MAP_TASK_COUNT += 1
+            _MAP_IDLE_TOTAL_S += idle_s
+            # print (not logger) so it forwards to the driver across all nodes.
+            print(
+                f"[MAP_IDLE] pid={os.getpid()} idle_s={idle_s:.3f} "
+                f"tasks={_MAP_TASK_COUNT} idle_total_s={_MAP_IDLE_TOTAL_S:.3f}",
+                flush=True,
+            )
+
     stats = BlockExecStats.builder()
 
-    # Use BlockAccessor so we also work for non-Arrow blocks (pandas, numpy)
-    accessors = [BlockAccessor.for_block(b) for b in blocks]
-    total_rows = sum(a.num_rows() for a in accessors)
-    total_bytes = sum((a.size_bytes() or 0) for a in accessors)
-
+    # Schema is derived from the (untruncated) input so empty shards still carry
+    # it even when this task claims zero rows under the fused limit.
     ipc_write_options = _ipc_write_options(compression)
     output_schema = TableBlockAccessor.try_convert_block_type(
         blocks[0], block_type=BlockType.ARROW
     ).schema
     empty_shard = _encode_partition_ipc(output_schema.empty_table(), ipc_write_options)
+
+    # Fused-limit path: claim a slice of the global row budget and truncate this
+    # task's blocks to it before partitioning.  See distributed_limit_counter.
+    limit_done = False
+    if limit_actor is not None:
+        from ray.data._internal.execution.operators.shuffle_operators.distributed_limit_counter import (  # noqa: E501
+            claim_and_truncate,
+        )
+
+        num_rows_in = sum(BlockAccessor.for_block(b).num_rows() for b in blocks)
+        truncated, limit_done = claim_and_truncate(
+            limit_actor, limit_task_id, blocks, num_rows_in
+        )
+        blocks = tuple(truncated)
+
+    # Use BlockAccessor so we also work for non-Arrow blocks (pandas, numpy)
+    accessors = [BlockAccessor.for_block(b) for b in blocks]
+    total_rows = sum(a.num_rows() for a in accessors)
+    total_bytes = sum((a.size_bytes() or 0) for a in accessors)
 
     partition_accumulators = (
         {} if total_rows == 0 else _partition_blocks_to_shards(blocks, partition_fn)
@@ -127,11 +187,16 @@ def _shuffle_map_task(
         partition_bufs.append(_encode_partition_ipc(merged, ipc_write_options))
         del merged
 
-    input_meta = BlockAccessor.for_block(blocks[0]).get_metadata(
+    # ``blocks`` may be empty when the fused limit claimed zero rows; fall back
+    # to an empty table of the output schema so we still produce metadata.
+    meta_block = blocks[0] if blocks else output_schema.empty_table()
+    input_meta = BlockAccessor.for_block(meta_block).get_metadata(
         block_exec_stats=stats.build(block_ser_time_s=0),
     )
     input_meta = replace(input_meta, num_rows=total_rows, size_bytes=total_bytes)
-    return (input_meta, shard_sizes, output_schema), *partition_bufs
+    if _LOG_MAP_WORKER_IDLE:
+        _LAST_MAP_TASK_END_S = time.monotonic()
+    return (input_meta, shard_sizes, output_schema, limit_done), *partition_bufs
 
 
 def _read_partition_ipc(buf: pa.Buffer) -> Optional[pa.Table]:
@@ -186,6 +251,19 @@ def _shuffle_reduce_task(
     accum_bytes: int = 0
     output_buffer: Optional[BlockOutputBuffer] = None
 
+    # -- Reduce profiling counters (only emitted when _PROFILE_REDUCE) --------
+    # fetch_s    : time blocked in ray.get() pulling shards (remote transfer +
+    #              spill restore from disk) -- the suspected reduce bottleneck.
+    # decode_s   : time decoding shard IPC buffers into Arrow tables.
+    # The reduce_fn + output-emit cost is (wall - fetch - decode), and Ray
+    # separately reports output-backpressure wait outside this task.
+    prof_fetch_s: float = 0.0
+    prof_max_batch_fetch_s: float = 0.0
+    prof_decode_s: float = 0.0
+    prof_num_shards: int = 0
+    prof_input_bytes: int = 0
+    prof_first_fetch_at_s: Optional[float] = None
+
     def _yield_with_stats(block: Block):
         """Yield (block, pickled metadata) following the streaming-gen protocol."""
         exec_stats_builder = BlockExecStats.builder()
@@ -222,12 +300,23 @@ def _shuffle_reduce_task(
     # flush through reduce_fn and yield any ready output blocks.
     for batch_start in range(0, len(shard_refs), batch_size):
         batch = shard_refs[batch_start : batch_start + batch_size]
-        for buf in ray.get(batch):
+        fetch_t0 = time.perf_counter()
+        bufs = ray.get(batch)
+        batch_fetch_s = time.perf_counter() - fetch_t0
+        prof_fetch_s += batch_fetch_s
+        prof_max_batch_fetch_s = max(prof_max_batch_fetch_s, batch_fetch_s)
+        if prof_first_fetch_at_s is None:
+            prof_first_fetch_at_s = fetch_t0 - start_time_s
+        for buf in bufs:
             if buf is None:
                 continue
+            decode_t0 = time.perf_counter()
             table = _read_partition_ipc(buf)
+            prof_decode_s += time.perf_counter() - decode_t0
             if table is None:
                 continue
+            prof_num_shards += 1
+            prof_input_bytes += table.nbytes
             accum_tables.append(table)
             accum_bytes += table.nbytes
 
@@ -251,3 +340,25 @@ def _shuffle_reduce_task(
         output_buffer.finalize()
         while output_buffer.has_next():
             yield from _yield_with_stats(output_buffer.next())
+
+    if _PROFILE_REDUCE:
+        wall_s = time.perf_counter() - start_time_s
+        # reduce_fn + emit (incl. output-backpressure wait at the yield points).
+        reduce_emit_s = max(0.0, wall_s - prof_fetch_s - prof_decode_s)
+        logger.info(
+            "[shuffle_reduce] partition=%d shards=%d input_mb=%.1f wall_s=%.2f "
+            "fetch_s=%.2f (%.0f%%) max_batch_fetch_s=%.2f first_fetch_at_s=%.2f "
+            "decode_s=%.2f (%.0f%%) reduce_emit_s=%.2f (%.0f%%)",
+            partition_id,
+            prof_num_shards,
+            prof_input_bytes / 1e6,
+            wall_s,
+            prof_fetch_s,
+            100.0 * prof_fetch_s / wall_s if wall_s else 0.0,
+            prof_max_batch_fetch_s,
+            prof_first_fetch_at_s or 0.0,
+            prof_decode_s,
+            100.0 * prof_decode_s / wall_s if wall_s else 0.0,
+            reduce_emit_s,
+            100.0 * reduce_emit_s / wall_s if wall_s else 0.0,
+        )
