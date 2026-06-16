@@ -49,6 +49,54 @@ def test_limit_repartition_row_count(ray_start, fuse, limit):
     assert n == limit, f"expected {limit} rows, got {n} (fuse={fuse})"
 
 
+def test_read_fused_into_shuffle_map(ray_start):
+    """With read fusion on, ReadParquet is absorbed into HashShuffleMap.
+
+    Validates both the plan shape (no separate read stage) and correctness
+    (row count + actual values preserved through the fused read+partition).
+    """
+    import os as _os
+    import tempfile
+
+    import pandas as pd
+
+    # Write a small parquet dataset to read back.
+    tmpdir = tempfile.mkdtemp()
+    ray.data.range(1000, override_num_blocks=8).map(
+        lambda r: {"id": r["id"], "v": r["id"] * 2}
+    ).write_parquet(tmpdir)
+
+    _os.environ["RAY_DATA_FUSE_READ_INTO_SHUFFLE"] = "1"
+    _os.environ.pop("RAY_DATA_FUSE_LIMIT_INTO_SHUFFLE", None)
+    DataContext.get_current().shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.read_parquet(tmpdir).repartition(4, keys=["id"]).materialize()
+    plan = ds.stats()
+    print(plan)
+
+    assert ds.count() == 1000
+    # Values survive the fused read+partition.
+    df = ds.to_pandas().sort_values("id").reset_index(drop=True)
+    assert (df["v"] == df["id"] * 2).all()
+
+
+def test_read_and_limit_both_fused(ray_start):
+    """read + limit + shuffle-map all fused into one map task."""
+    import os as _os
+
+    _os.environ["RAY_DATA_FUSE_READ_INTO_SHUFFLE"] = "1"
+    _os.environ["RAY_DATA_FUSE_LIMIT_INTO_SHUFFLE"] = "1"
+    DataContext.get_current().shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = (
+        ray.data.range(2000, override_num_blocks=8)
+        .limit(500)
+        .repartition(4, keys=["id"])
+        .materialize()
+    )
+    assert ds.count() == 500
+
+
 def test_fused_plan_drops_limit_operator(ray_start):
     """With fusion on, the optimized physical plan has no standalone Limit op."""
     os.environ["RAY_DATA_FUSE_LIMIT_INTO_SHUFFLE"] = "1"

@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import time
+import typing
 from dataclasses import replace
 from typing import Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
@@ -11,6 +12,10 @@ import pyarrow as pa
 
 import ray
 from ray import ObjectRef
+from ray.data.context import DataContext
+
+if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.operators.map_transformer import MapTransformer
 from ray._raylet import (
     StreamingGeneratorStats,  # pyrefly: ignore[missing-module-attribute]
 )
@@ -119,14 +124,24 @@ def _shuffle_map_task(
     compression: Optional[str],
     limit_actor: Optional["ray.actor.ActorHandle"] = None,
     limit_task_id: Optional[int] = None,
+    map_transformer: Optional["MapTransformer"] = None,
+    data_context: Optional["DataContext"] = None,
+    op_name: str = "ShuffleMap",
+    task_idx: int = 0,
 ):
     """Map stage: partition the input blocks and return one shard per partition.
 
-    When ``limit_actor`` is set, a ``Limit`` has been fused into this shuffle:
-    before partitioning, the task claims a slice of the global row budget from
-    the counter actor and truncates its blocks accordingly, so the union of all
-    map outputs respects the limit.  ``limit_done`` is returned in the metadata
-    tuple so the operator can stop submitting tasks once the budget is spent.
+    When ``map_transformer`` is set, an upstream read/map op has been fused into
+    this shuffle: the transformer is applied to this task's inputs *here* (so the
+    read runs in the same task as the partitioning, with no intermediate
+    object-store materialization), turning read-task inputs into data blocks
+    before partitioning.
+
+    When ``limit_actor`` is set, a ``Limit`` has been fused too: after the read,
+    the task claims a slice of the global row budget from the counter actor and
+    truncates its blocks, so the union of all map outputs respects the limit.
+    ``limit_done`` is returned in the metadata tuple so the operator can stop
+    submitting tasks once the budget is spent.
     """
     if _LOG_MAP_WORKER_IDLE:
         global _LAST_MAP_TASK_END_S, _MAP_TASK_COUNT, _MAP_IDLE_TOTAL_S
@@ -144,12 +159,29 @@ def _shuffle_map_task(
 
     stats = BlockExecStats.builder()
 
+    # Fused read: materialize this task's input by applying the upstream
+    # read/map transformer here, so the read happens in the same task as the
+    # partitioning -- no intermediate object-store round-trip of read output.
+    if map_transformer is not None:
+        from ray.data._internal.execution.interfaces.task_context import TaskContext
+
+        tmbs = data_context.target_max_block_size if data_context else None
+        tctx = TaskContext(
+            task_idx=task_idx, op_name=op_name, target_max_block_size_override=tmbs
+        )
+        with DataContext.current(data_context), TaskContext.current(tctx):
+            map_transformer.override_target_max_block_size(tmbs)
+            blocks = tuple(map_transformer.apply_transform(iter(blocks), tctx))
+
     # Schema is derived from the (untruncated) input so empty shards still carry
     # it even when this task claims zero rows under the fused limit.
     ipc_write_options = _ipc_write_options(compression)
-    output_schema = TableBlockAccessor.try_convert_block_type(
-        blocks[0], block_type=BlockType.ARROW
-    ).schema
+    if blocks:
+        output_schema = TableBlockAccessor.try_convert_block_type(
+            blocks[0], block_type=BlockType.ARROW
+        ).schema
+    else:
+        output_schema = pa.schema([])
     empty_shard = _encode_partition_ipc(output_schema.empty_table(), ipc_write_options)
 
     # Fused-limit path: claim a slice of the global row budget and truncate this

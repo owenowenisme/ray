@@ -52,6 +52,29 @@ Gated behind `RAY_DATA_FUSE_LIMIT_INTO_SHUFFLE=1`; off by default the
   from this worktree, so `myenv` currently points at the worktree, not the main
   repo -- re-run it from the main repo to restore that workflow.
 
+## Read → shuffle-map fusion (added)
+
+Absorbs an upstream read/map op (e.g. `ReadParquet`) into the V2 hash-shuffle map
+phase, so each map task reads its fragment AND partitions in one task — no
+intermediate object-store materialization of read output (the Daft shape).
+
+- Gated behind `RAY_DATA_FUSE_READ_INTO_SHUFFLE=1`. Composes with the limit flag.
+- Lives in `FuseOperators._fuse_read_into_shuffle_map_in_dag` (operator_fusion.py),
+  NOT the planner. **Key lesson:** it must run *after* `SetReadParallelismRule`
+  (a physical rule), so the read op's parallelism is set before we absorb it.
+  Doing it in `plan_all_to_all_op` bypassed the read op too early →
+  `AssertionError: Read parallelism must be set by the optimizer before execution`
+  (plan_read_op.py:76, fired from the lazy `get_input_data` closure at execution).
+- Mechanism: mutate the `ShuffleMapOp` in place — stash
+  `up.get_map_transformer()` in `_fused_map_transformer`, set
+  `_pre_map_merge_threshold = 0` (inputs are read-task handles, not data blocks, so
+  one fused task per input bundle preserves read parallelism), repoint
+  `_input_dependencies` to the read's own input, pop the read from `_op_map`.
+- `_shuffle_map_task` applies the transformer under `DataContext`/`TaskContext`
+  before claiming the limit and partitioning.
+- **Validated:** plan shows `ShuffleMapOp[ReadParquet->HashShuffleMap]` (no separate
+  read stage); count + values correct; read+limit+shuffle all fuse together.
+
 ## Not yet done (follow-ups)
 
 1. **Active early termination.** We currently drop the input *tail* after a

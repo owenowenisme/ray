@@ -95,8 +95,11 @@ def _plan_hash_shuffle_repartition(
         # Bypass the LimitOperator: feed the shuffle directly from the limit's
         # own upstream.
         input_physical_op = input_physical_op.input_dependencies[0]
-        input_logical_op = input_physical_op._logical_operators[0]
-        estimated_input_blocks = input_logical_op.estimated_num_outputs()
+
+    # NOTE: read->shuffle-map fusion is NOT done here. It must run after
+    # SetReadParallelismRule (a physical rule), so it lives in FuseOperators
+    # (see _fuse_read_into_shuffle_map_in_dag). Doing it in the planner bypasses
+    # the read op before its parallelism is set -> execution-time assertion.
 
     map_op = ShuffleMapOp(
         input_physical_op,

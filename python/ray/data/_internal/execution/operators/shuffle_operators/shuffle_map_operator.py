@@ -37,6 +37,7 @@ from ray.types import ObjectRef
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.operators.map_transformer import MapTransformer
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
         limit: Optional[int] = None,
         limit_offset: int = 0,
+        map_transformer: Optional["MapTransformer"] = None,
         name: str = "ShuffleMap",
     ):
         super().__init__(
@@ -124,7 +126,20 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._shuffle_map_task_num_cpus: float = map_cpus
         self._map_runtime_env: Optional[Dict[str, Any]] = map_runtime_env
 
+        # -- Fused upstream read/map -----------------------------------------
+        # When set, the upstream read/map op was fused into this shuffle: each
+        # map task applies this transformer to its inputs (turning read-task
+        # inputs into data blocks) before partitioning, so the read happens in
+        # the same task -- no intermediate object-store materialization.
+        self._fused_map_transformer: Optional["MapTransformer"] = map_transformer
+
         # -- Pre-map merge ---------------------------------------------------
+        # When fused with an upstream read, inputs are read-task handles (not
+        # data blocks), so the byte-based merge heuristic doesn't apply -- run
+        # one fused read+partition task per input bundle (preserves read
+        # parallelism, like one map task per read fragment).
+        if map_transformer is not None:
+            pre_map_merge_threshold = 0
         self._pre_map_merge_threshold: int = pre_map_merge_threshold
         # Flush buffered partials early when in-flight map tasks fall to/below
         # this floor, so workers don't idle through ramp-up / upstream wind-down.
@@ -332,6 +347,10 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             compression=self.data_context.hash_shuffle_compression,
             limit_actor=self._limit_actor,
             limit_task_id=cur_task_idx,
+            map_transformer=self._fused_map_transformer,
+            data_context=self.data_context,
+            op_name=self.name,
+            task_idx=cur_task_idx,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])

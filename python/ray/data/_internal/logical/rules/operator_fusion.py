@@ -1,5 +1,6 @@
 import itertools
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from ray.data._internal.compute import (
@@ -23,6 +24,9 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
 from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator import (  # noqa: E501
+    ShuffleMapOp,
+)
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
@@ -67,6 +71,12 @@ class FuseOperators(Rule):
         # Now that we have fused together all back-to-back map operators,
         # we fuse together MapOperator -> AllToAllOperator pairs.
         fused_dag = self._fuse_all_to_all_operators_in_dag(fused_dag)
+
+        # PROTOTYPE: fuse an upstream read/map op into the V2 hash-shuffle map
+        # phase. Runs here (after SetReadParallelismRule) so the read op's
+        # parallelism is set before we absorb it. Gated behind an env flag.
+        if os.environ.get("RAY_DATA_FUSE_READ_INTO_SHUFFLE") == "1":
+            fused_dag = self._fuse_read_into_shuffle_map_in_dag(fused_dag)
 
         # Update output dependencies after fusion.
         # TODO(hchen): Instead of updating the depdencies manually,
@@ -131,6 +141,42 @@ class FuseOperators(Rule):
 
         dag._input_dependencies = [
             self._fuse_streaming_repartition_operators_in_dag(upstream_op)
+            for upstream_op in upstream_ops
+        ]
+        return dag
+
+    def _fuse_read_into_shuffle_map_in_dag(
+        self, dag: PhysicalOperator
+    ) -> PhysicalOperator:
+        """Fuse a (TaskPoolMapOperator -> ShuffleMapOp) pair.
+
+        Absorbs an upstream read/map op into the V2 hash-shuffle map phase: the
+        ShuffleMapOp's tasks apply the upstream transformer to their inputs before
+        partitioning, so read+partition run in one task with no intermediate
+        object-store materialization of the read output. Mutates the ShuffleMapOp
+        in place (stash transformer, bypass pre-map merge, repoint input).
+        """
+        upstream_ops = dag.input_dependencies
+        if (
+            len(upstream_ops) == 1
+            and isinstance(dag, ShuffleMapOp)
+            and dag._fused_map_transformer is None
+            and isinstance(upstream_ops[0], TaskPoolMapOperator)
+            and upstream_ops[0].supports_fusion()
+            and len(upstream_ops[0].input_dependencies) == 1
+        ):
+            up = upstream_ops[0]
+            dag._fused_map_transformer = up.get_map_transformer()
+            # Inputs are now read-task handles, not data blocks: the byte-based
+            # merge heuristic doesn't apply, so run one fused task per input.
+            dag._pre_map_merge_threshold = 0
+            dag._name = up.name + "->" + dag.name
+            dag._input_dependencies = [up.input_dependencies[0]]
+            self._op_map.pop(up, None)
+            upstream_ops = dag.input_dependencies
+
+        dag._input_dependencies = [
+            self._fuse_read_into_shuffle_map_in_dag(upstream_op)
             for upstream_op in upstream_ops
         ]
         return dag
