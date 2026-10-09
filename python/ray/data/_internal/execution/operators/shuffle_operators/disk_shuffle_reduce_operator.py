@@ -154,6 +154,11 @@ class DiskHashShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         remote_args.update(user_args)
         if user_runtime_env is not None:
             remote_args["runtime_env"] = _merged_reduce_runtime_env(user_runtime_env)
+        # Mirror ShuffleReduceOp: name the task after its operator. Ray Core
+        # otherwise falls back to the function descriptor, so every reduce
+        # stage of a multi-join query collapses into one
+        # "_disk_shuffle_reduce_task" row in the dashboard and nothing can
+        # attribute a state-API task event back to an operator.
         remote_args["name"] = self.name
         remote_args["num_returns"] = "streaming"
         return remote_args

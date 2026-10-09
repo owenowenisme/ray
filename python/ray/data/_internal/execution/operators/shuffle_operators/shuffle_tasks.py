@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import time
 import typing
 from dataclasses import replace
@@ -38,7 +39,13 @@ ReduceFn = Callable[[int, List[List[pa.Table]]], Iterable[Block]]
 BlockTransformer = Callable[["pa.Table"], "pa.Table"]
 
 # Peak working-set of a shuffle map/reduce task is ~2x the input bytes
-SHUFFLE_PEAK_MEMORY_MULTIPLIER = 2
+# EXPERIMENT KNOB (not upstream): a reduce task asks for
+# `input_bytes * SHUFFLE_PEAK_MEMORY_MULTIPLIER`, and that request is what
+# caps concurrency once the cluster's memory budget is exhausted. Read it
+# from the environment so the multiplier can be swept without a rebuild.
+SHUFFLE_PEAK_MEMORY_MULTIPLIER = float(
+    os.environ.get("RAY_DATA_SHUFFLE_PEAK_MEMORY_MULTIPLIER", "2")
+)
 
 
 def _ipc_write_options(compression: Optional[str]) -> pa.ipc.IpcWriteOptions:

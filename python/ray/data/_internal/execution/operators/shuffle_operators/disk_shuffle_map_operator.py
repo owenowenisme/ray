@@ -88,7 +88,28 @@ class DiskHashShuffleMapOp(
         self._block_transformer: Optional[BlockTransformer] = block_transformer
 
         # -- Map task config -------------------------------------------------
-        self._shuffle_map_task_num_cpus: float = map_cpus
+        # Read at construction time rather than as a default argument so the
+        # env var still applies when the planner passes map_cpus explicitly.
+        # The reservation is deliberately separable from the task's real CPU
+        # draw: the fused read+map task measures cpu/busy = 1.19, so a 1.0
+        # reservation already undercounts it by 19%. Sweeping this is how we
+        # tell apart "concurrency-limited" from "memory-bandwidth-limited" --
+        # under the latter, cutting the slot count leaves wall unchanged while
+        # cpu_s falls.
+        self._shuffle_map_task_num_cpus: float = float(
+            os.environ.get("RAY_DATA_SHUFFLE_MAP_TASK_NUM_CPUS", map_cpus)
+        )
+        if self._shuffle_map_task_num_cpus != map_cpus:
+            # Logged because a null result is ambiguous otherwise: 0.5 is
+            # expected to change nothing if memory admission is what caps
+            # concurrency, and that reads the same as the override not
+            # being picked up at all.
+            logger.info(
+                "shuffle map task num_cpus overridden: %s -> %s (%s)",
+                map_cpus,
+                self._shuffle_map_task_num_cpus,
+                name,
+            )
         self._map_runtime_env: Optional[Dict[str, Any]] = map_runtime_env
 
         # -- Pre-map merge ---------------------------------------------------
@@ -225,6 +246,8 @@ class DiskHashShuffleMapOp(
         if estimated_bytes > 0:
             resources["memory"] = estimated_bytes * SHUFFLE_PEAK_MEMORY_MULTIPLIER
 
+        # Mirror ShuffleMapOp: name the task after its operator (see
+        # DiskHashShuffleReduceOp._reduce_task_remote_args for why).
         ray_options: Dict[str, Any] = {**resources, "name": self.name}
         if target_node_id is not None:
             ray_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
@@ -393,6 +416,33 @@ class DiskHashShuffleMapOp(
         self._shared_handles_ref = ray.put(self._completed_handle_refs)
 
         partition_bytes = self.get_partition_bytes()
+        # EXPERIMENT (RAY_DATA_SHUFFLE_BYTES_PROF=1): the real per-stage shuffle
+        # volume (decoded, pre-compression) is accumulated on this op from every
+        # mapper handle and then dropped -- BlockMetadata carries zeros under
+        # disk shuffle, so the trace's size_bytes is handle metadata, not data.
+        # One driver-side line per op at emission gives Spark's
+        # shuffle_write_gb analogue plus the per-partition skew histogram.
+        if os.environ.get("RAY_DATA_SHUFFLE_BYTES_PROF") == "1":
+            _nz = sorted(
+                ((p, b) for p, b in partition_bytes.items() if b),
+                key=lambda kv: -kv[1],
+            )
+            _tot = sum(b for _, b in _nz)
+            _sizes = [b for _, b in _nz]
+            _top = " ".join(f"p{p}={b / 2**20:.0f}MiB" for p, b in _nz[:5])
+            print(
+                f"[SHUF_BYTES] op={self.name!r} "
+                f"rows={sum(self._partition_rows.values())} "
+                f"bytes={_tot} ({_tot / 2**30:.2f}GiB) "
+                f"nonempty={len(_nz)}/{self._num_partitions} "
+                f"max={(_sizes[0] / 2**20):.0f}MiB "
+                f"p50={(_sizes[len(_sizes) // 2] / 2**20):.0f}MiB "
+                f"top5=[{_top}]"
+                if _nz
+                else f"[SHUF_BYTES] op={self.name!r} rows=0 bytes=0 "
+                f"nonempty=0/{self._num_partitions}",
+                flush=True,
+            )
         for partition_id in range(self._num_partitions):
             exec_stats = BlockExecStats.builder().build(block_ser_time_s=0.0)
             wrapper_meta = BlockMetadata(
